@@ -34,11 +34,14 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 /// Number of days to retain tracking history before automatic cleanup.
 const HISTORY_DAYS: i64 = 90;
+const TRACKING_DB_FILE: &str = "history.db";
+const REDACTED_VALUE: &str = "<redacted>";
 
 /// Main tracking interface for recording and querying command history.
 ///
@@ -66,7 +69,7 @@ const HISTORY_DAYS: i64 = 90;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub struct Tracker {
-    conn: Connection,
+    conn: Option<Connection>,
 }
 
 /// Individual command record from tracking history.
@@ -221,9 +224,13 @@ impl Tracker {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new() -> Result<Self> {
+        if !is_tracking_enabled()? {
+            return Ok(Self { conn: None });
+        }
+
         let db_path = get_db_path()?;
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
 
         let conn = Connection::open(&db_path)?;
@@ -252,7 +259,9 @@ impl Tracker {
             [],
         );
 
-        Ok(Self { conn })
+        enforce_local_db_permissions(&db_path)?;
+
+        Ok(Self { conn: Some(conn) })
     }
 
     /// Record a command execution with token counts and timing.
@@ -285,6 +294,11 @@ impl Tracker {
         output_tokens: usize,
         exec_time_ms: u64,
     ) -> Result<()> {
+        let conn = match &self.conn {
+            Some(conn) => conn,
+            None => return Ok(()),
+        };
+
         let saved = input_tokens.saturating_sub(output_tokens);
         let pct = if input_tokens > 0 {
             (saved as f64 / input_tokens as f64) * 100.0
@@ -292,7 +306,10 @@ impl Tracker {
             0.0
         };
 
-        self.conn.execute(
+        let original_cmd = sanitize_command_for_tracking(original_cmd);
+        let rtk_cmd = sanitize_command_for_tracking(rtk_cmd);
+
+        conn.execute(
             "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -307,13 +324,19 @@ impl Tracker {
             ],
         )?;
 
+        drop(conn);
         self.cleanup_old()?;
         Ok(())
     }
 
     fn cleanup_old(&self) -> Result<()> {
+        let conn = match &self.conn {
+            Some(conn) => conn,
+            None => return Ok(()),
+        };
+
         let cutoff = Utc::now() - chrono::Duration::days(HISTORY_DAYS);
-        self.conn.execute(
+        conn.execute(
             "DELETE FROM commands WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
         )?;
@@ -346,7 +369,21 @@ impl Tracker {
         let mut total_saved = 0usize;
         let mut total_time_ms = 0u64;
 
-        let mut stmt = self.conn.prepare(
+        let Some(conn) = self.conn.as_ref() else {
+            return Ok(GainSummary {
+                total_commands: 0,
+                total_input: 0,
+                total_output: 0,
+                total_saved: 0,
+                avg_savings_pct: 0.0,
+                total_time_ms: 0,
+                avg_time_ms: 0,
+                by_command: Vec::new(),
+                by_day: Vec::new(),
+            });
+        };
+
+        let mut stmt = conn.prepare(
             "SELECT input_tokens, output_tokens, saved_tokens, exec_time_ms FROM commands",
         )?;
 
@@ -397,7 +434,11 @@ impl Tracker {
     }
 
     fn get_by_command(&self) -> Result<Vec<(String, usize, usize, f64, u64)>> {
-        let mut stmt = self.conn.prepare(
+        let Some(conn) = self.conn.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = conn.prepare(
             "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
              FROM commands
              GROUP BY rtk_cmd
@@ -419,7 +460,11 @@ impl Tracker {
     }
 
     fn get_by_day(&self) -> Result<Vec<(String, usize)>> {
-        let mut stmt = self.conn.prepare(
+        let Some(conn) = self.conn.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = conn.prepare(
             "SELECT DATE(timestamp), SUM(saved_tokens)
              FROM commands
              GROUP BY DATE(timestamp)
@@ -455,7 +500,11 @@ impl Tracker {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn get_all_days(&self) -> Result<Vec<DayStats>> {
-        let mut stmt = self.conn.prepare(
+        let Some(conn) = self.conn.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = conn.prepare(
             "SELECT
                 DATE(timestamp) as date,
                 COUNT(*) as commands,
@@ -520,7 +569,11 @@ impl Tracker {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn get_by_week(&self) -> Result<Vec<WeekStats>> {
-        let mut stmt = self.conn.prepare(
+        let Some(conn) = self.conn.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = conn.prepare(
             "SELECT
                 DATE(timestamp, 'weekday 0', '-6 days') as week_start,
                 DATE(timestamp, 'weekday 0') as week_end,
@@ -587,7 +640,11 @@ impl Tracker {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn get_by_month(&self) -> Result<Vec<MonthStats>> {
-        let mut stmt = self.conn.prepare(
+        let Some(conn) = self.conn.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = conn.prepare(
             "SELECT
                 strftime('%Y-%m', timestamp) as month,
                 COUNT(*) as commands,
@@ -655,7 +712,11 @@ impl Tracker {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn get_recent(&self, limit: usize) -> Result<Vec<CommandRecord>> {
-        let mut stmt = self.conn.prepare(
+        let Some(conn) = self.conn.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = conn.prepare(
             "SELECT timestamp, rtk_cmd, saved_tokens, savings_pct
              FROM commands
              ORDER BY timestamp DESC
@@ -678,21 +739,100 @@ impl Tracker {
 }
 
 fn get_db_path() -> Result<PathBuf> {
+    let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    let data_root = data_dir.join("rtk");
+
+    let fallback = data_root.join(TRACKING_DB_FILE);
+
     // Priority 1: Environment variable RTK_DB_PATH
     if let Ok(custom_path) = std::env::var("RTK_DB_PATH") {
-        return Ok(PathBuf::from(custom_path));
+        return Ok(sanitize_tracking_db_path(PathBuf::from(custom_path), &data_root));
     }
 
     // Priority 2: Configuration file
     if let Ok(config) = crate::config::Config::load() {
         if let Some(db_path) = config.tracking.database_path {
-            return Ok(db_path);
+            return Ok(sanitize_tracking_db_path(db_path, &data_root));
         }
     }
 
-    // Priority 3: Default platform-specific location
-    let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    Ok(data_dir.join("rtk").join("history.db"))
+    Ok(fallback)
+}
+
+fn sanitize_tracking_db_path(path: PathBuf, data_root: &Path) -> PathBuf {
+    if path.as_os_str().is_empty() {
+        return data_root.join(TRACKING_DB_FILE);
+    }
+
+    if path.is_relative() {
+        if has_parent_dir_component(&path) {
+            return data_root.join(TRACKING_DB_FILE);
+        }
+        return data_root.join(path);
+    }
+
+    if has_parent_dir_component(&path) {
+        return data_root.join(TRACKING_DB_FILE);
+    }
+
+    if path.starts_with(data_root) {
+        return path;
+    }
+
+    data_root.join(TRACKING_DB_FILE)
+}
+
+fn has_parent_dir_component(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, Component::ParentDir))
+}
+
+fn enforce_local_db_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            if perms.mode() & 0o777 != 0o600 {
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_tracking_enabled() -> Result<bool> {
+    if let Ok(raw) = std::env::var("RTK_TRACKING") {
+        if let Some(enabled) = parse_bool_env(raw.trim()) {
+            return Ok(enabled);
+        }
+    }
+
+    if let Ok(raw) = std::env::var("RTK_TRACKING_ENABLED") {
+        if let Some(enabled) = parse_bool_env(raw.trim()) {
+            return Ok(enabled);
+        }
+    }
+
+    if let Ok(raw) = std::env::var("RTK_DISABLE_TRACKING") {
+        if let Some(disabled) = parse_bool_env(raw.trim()) {
+            return Ok(!disabled);
+        }
+    }
+
+    Ok(crate::config::Config::load()
+        .map(|config| config.tracking.enabled)
+        .unwrap_or(false))
+}
+
+fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enable" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
 }
 
 /// Estimate token count from text using ~4 chars = 1 token heuristic.
@@ -887,6 +1027,171 @@ pub fn track(original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
     }
 }
 
+fn sanitize_command_for_tracking(command: &str) -> String {
+    if command.is_empty() {
+        return String::new();
+    }
+
+    let mut result = Vec::new();
+    let mut redact_next = false;
+
+    for token in command.split_whitespace() {
+        if redact_next {
+            result.push(REDACTED_VALUE.to_string());
+            let normalized = normalize_token_for_match(token);
+            redact_next = matches!(normalized.as_str(), "bearer" | "basic" | "token");
+            continue;
+        }
+
+        if let Some(redacted) = mask_url_credentials(token) {
+            result.push(redacted);
+            continue;
+        }
+
+        if let Some((name, _value)) = token.split_once('=') {
+            if is_sensitive_key(name) {
+                result.push(format!("{}={}", name, REDACTED_VALUE));
+            } else {
+                result.push(format!("{name}={_value}"));
+            }
+            continue;
+        }
+
+        if let Some((name, value)) = token.split_once(':') {
+            if is_sensitive_key(name) {
+                result.push(format!("{}:{}", name, REDACTED_VALUE));
+                if token.ends_with(':') || should_redact_next_for_colon_value(value) {
+                    redact_next = true;
+                }
+                continue;
+            }
+        }
+
+        if is_sensitive_flag(token) {
+            result.push(token.to_string());
+            redact_next = true;
+            continue;
+        }
+
+        if is_sensitive_key(token) {
+            result.push(REDACTED_VALUE.to_string());
+            continue;
+        }
+
+        result.push(token.to_string());
+    }
+
+    if redact_next {
+        result.push(REDACTED_VALUE.to_string());
+    }
+
+    result.join(" ")
+}
+
+fn is_sensitive_flag(token: &str) -> bool {
+    let key = token
+        .trim_start_matches('-')
+        .split(|c| c == '=' || c == ':')
+        .next()
+        .unwrap_or_default();
+
+    is_sensitive_key(&key)
+}
+
+fn is_sensitive_key(token: &str) -> bool {
+    let key = normalize_token_for_match(token);
+    if key.is_empty() {
+        return false;
+    }
+
+    const SENSITIVE_PARTS: [&str; 25] = [
+        "token",
+        "secret",
+        "password",
+        "auth",
+        "authorization",
+        "apikey",
+        "api_key",
+        "api-key",
+        "access_token",
+        "access-token",
+        "auth_token",
+        "auth-token",
+        "private_key",
+        "private-key",
+        "credential",
+        "client_secret",
+        "client-secret",
+        "private",
+        "session",
+        "jwt",
+        "cookie",
+        "key",
+        "pass",
+        "passphrase",
+        "bearer",
+    ];
+
+    let parts = key.split(|c: char| !c.is_ascii_alphanumeric());
+    if parts
+        .clone()
+        .filter(|part| !part.is_empty())
+        .any(|part| SENSITIVE_PARTS.contains(&part))
+    {
+        return true;
+    }
+
+    let parts: Vec<_> = parts.filter(|part| !part.is_empty()).collect();
+    parts
+        .windows(2)
+        .any(|window| {
+            window[0] == "api" && (window[1] == "key" || window[1] == "token" || window[1] == "secret")
+                || window[0] == "access" && window[1] == "token"
+                || window[0] == "auth" && window[1] == "token"
+                || window[0] == "private" && window[1] == "key"
+                || window[0] == "client" && window[1] == "secret"
+        })
+}
+
+fn normalize_token_for_match(token: &str) -> String {
+    token
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim()
+        .trim_start_matches('-')
+        .trim_end_matches(':')
+        .to_ascii_lowercase()
+}
+
+fn mask_url_credentials(token: &str) -> Option<String> {
+    let scheme_end = token.find("://")?;
+    let after = &token[scheme_end + 3..];
+    let at = after.find('@')?;
+    let creds = &after[..at];
+    if creds.is_empty() {
+        return None;
+    }
+
+    let masked = if creds.contains(':') {
+        format!("{REDACTED_VALUE}:{REDACTED_VALUE}@")
+    } else {
+        format!("{REDACTED_VALUE}@")
+    };
+
+    Some(format!(
+        "{}{}{}",
+        &token[..scheme_end + 3],
+        masked,
+        &after[at + 1..]
+    ))
+}
+
+fn should_redact_next_for_colon_value(value: &str) -> bool {
+    matches!(
+        normalize_token_for_match(value).as_str(),
+        "bearer" | "basic" | "token"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,21 +1317,70 @@ mod tests {
         assert_eq!(pt.saved_tokens, 0);
     }
 
-    // 7. get_db_path respects environment variable RTK_DB_PATH
+    // 7. sanitize_command_for_tracking redacts likely secrets
+    #[test]
+    fn test_sanitize_command_for_tracking_redacts_sensitive_tokens() {
+        assert_eq!(
+            sanitize_command_for_tracking("API_KEY=abc123"),
+            format!("API_KEY={}", REDACTED_VALUE)
+        );
+        assert_eq!(
+            sanitize_command_for_tracking("curl -H Authorization: Bearer deadbeef"),
+            format!(
+                "curl -H Authorization:{} {} {}",
+                REDACTED_VALUE, REDACTED_VALUE, REDACTED_VALUE
+            )
+        );
+        assert_eq!(sanitize_command_for_tracking("git status"), "git status");
+    }
+
+    #[test]
+    fn test_mask_url_credentials() {
+        assert_eq!(
+            sanitize_command_for_tracking("curl https://u:p@api.example.com/data"),
+            format!("curl https://{}:{}@api.example.com/data", REDACTED_VALUE, REDACTED_VALUE)
+        );
+        assert_eq!(
+            sanitize_command_for_tracking("curl https://user@api.example.com/data"),
+            "curl https://<redacted>@api.example.com/data".to_string()
+        );
+    }
+
+    // 9. get_db_path respects environment variable RTK_DB_PATH
     #[test]
     fn test_custom_db_path_env() {
         use std::env;
 
-        let custom_path = "/tmp/rtk_test_custom.db";
-        env::set_var("RTK_DB_PATH", custom_path);
+        let custom_path = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("rtk")
+            .join("rtk_test_custom.db");
+        env::set_var("RTK_DB_PATH", custom_path.to_string_lossy().as_ref());
 
         let db_path = get_db_path().expect("Failed to get db path");
-        assert_eq!(db_path, PathBuf::from(custom_path));
+        assert_eq!(db_path, custom_path);
 
         env::remove_var("RTK_DB_PATH");
     }
 
-    // 8. get_db_path falls back to default when no custom config
+    #[test]
+    fn test_custom_db_path_env_rejects_external_path() {
+        use std::env;
+
+        env::set_var("RTK_DB_PATH", "/tmp/rtk_test_custom.db");
+
+        let data_root = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("rtk");
+        let expected = data_root.join(TRACKING_DB_FILE);
+
+        let db_path = get_db_path().expect("Failed to get db path");
+        assert_eq!(db_path, expected);
+
+        env::remove_var("RTK_DB_PATH");
+    }
+
+    // 10. get_db_path falls back to default when no custom config
     #[test]
     fn test_default_db_path() {
         use std::env;

@@ -4,11 +4,15 @@
 # Outputs JSON with updatedInput to modify the command before execution.
 
 # Guards: skip silently if dependencies missing
-if ! command -v rtk &>/dev/null || ! command -v jq &>/dev/null; then
+if ! command -v jq &>/dev/null; then
+  exit 0
+fi
+if [ -z "${RTK_BIN:-}" ] && ! command -v rtk &>/dev/null; then
   exit 0
 fi
 
 set -euo pipefail
+RTK_BIN="${RTK_BIN:-$(command -v rtk)}"
 
 INPUT=$(cat)
 CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
@@ -32,154 +36,191 @@ case "$FIRST_CMD" in
 esac
 
 # Strip leading env var assignments for pattern matching
-# e.g., "TEST_SESSION_ID=2 npx playwright test" → match against "npx playwright test"
+# e.g., "TEST_SESSION_ID=2 npx playwright test" -> match against "npx playwright test"
 # but preserve them in the rewritten command for execution.
 ENV_PREFIX=$(echo "$FIRST_CMD" | grep -oE '^([A-Za-z_][A-Za-z0-9_]*=[^ ]* +)+' || echo "")
 if [ -n "$ENV_PREFIX" ]; then
   MATCH_CMD="${FIRST_CMD:${#ENV_PREFIX}}"
-  CMD_BODY="${CMD:${#ENV_PREFIX}}"
 else
   MATCH_CMD="$FIRST_CMD"
-  CMD_BODY="$CMD"
 fi
+CMD_BODY="$MATCH_CMD"
+
+# Strip common runner wrappers so rules stay generic across projects.
+# Keep runner prefix for final reconstructed command.
+RUNNER_PREFIX=""
+if [[ "$MATCH_CMD" == "uv run "* ]]; then
+  RUNNER_PREFIX="uv run "
+elif [[ "$MATCH_CMD" == "poetry run "* ]]; then
+  RUNNER_PREFIX="poetry run "
+elif [[ "$MATCH_CMD" == "pipenv run "* ]]; then
+  RUNNER_PREFIX="pipenv run "
+elif [[ "$MATCH_CMD" == "hatch run "* ]]; then
+  RUNNER_PREFIX="hatch run "
+elif [[ "$MATCH_CMD" == "rye run "* ]]; then
+  RUNNER_PREFIX="rye run "
+elif [[ "$MATCH_CMD" == "npm exec -- "* ]]; then
+  RUNNER_PREFIX="npm exec -- "
+elif [[ "$MATCH_CMD" == "npm exec "* ]]; then
+  RUNNER_PREFIX="npm exec "
+elif [[ "$MATCH_CMD" == "pnpm exec "* ]]; then
+  RUNNER_PREFIX="pnpm exec "
+fi
+
+if [ -n "$RUNNER_PREFIX" ]; then
+  MATCH_CMD="${MATCH_CMD:${#RUNNER_PREFIX}}"
+  CMD_BODY="${CMD_BODY:${#RUNNER_PREFIX}}"
+fi
+
+# Skip if command is already routed through rtk after prefix stripping.
+case "$MATCH_CMD" in
+  rtk\ *|*/rtk\ *) exit 0 ;;
+esac
+
+rewrite_with_context() {
+  local rewritten_inner="$1"
+  if [ -z "$RUNNER_PREFIX" ]; then
+    printf "%s%s" "$ENV_PREFIX" "$rewritten_inner"
+    return
+  fi
+
+  # Preserve runner environment, but force absolute rtk binary path for reliability.
+  printf "%s%s%s %s" "$ENV_PREFIX" "$RUNNER_PREFIX" "$RTK_BIN" "${rewritten_inner#rtk }"
+}
 
 REWRITTEN=""
 
 # --- Git commands ---
 if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+status([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git status/rtk git status/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git status/rtk git status/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+diff([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git diff/rtk git diff/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git diff/rtk git diff/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+log([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git log/rtk git log/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git log/rtk git log/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+add([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git add/rtk git add/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git add/rtk git add/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+commit([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git commit/rtk git commit/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git commit/rtk git commit/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+push([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git push/rtk git push/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git push/rtk git push/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+pull([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git pull/rtk git pull/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git pull/rtk git pull/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+branch([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git branch/rtk git branch/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git branch/rtk git branch/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+fetch([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git fetch/rtk git fetch/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git fetch/rtk git fetch/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+stash([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git stash/rtk git stash/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git stash/rtk git stash/')")"
 elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+show([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^git show/rtk git show/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git show/rtk git show/')")"
 
 # --- GitHub CLI (added: api, release) ---
 elif echo "$MATCH_CMD" | grep -qE '^gh[[:space:]]+(pr|issue|run|api|release)([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^gh /rtk gh /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^gh /rtk gh /')")"
 
 # --- Cargo ---
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+test([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo test/rtk cargo test/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo test/rtk cargo test/')")"
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+build([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo build/rtk cargo build/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo build/rtk cargo build/')")"
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+clippy([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo clippy/rtk cargo clippy/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo clippy/rtk cargo clippy/')")"
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+check([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo check/rtk cargo check/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo check/rtk cargo check/')")"
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+install([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo install/rtk cargo install/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo install/rtk cargo install/')")"
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+fmt([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo fmt/rtk cargo fmt/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo fmt/rtk cargo fmt/')")"
 
 # --- File operations ---
 elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')")"
 elif echo "$MATCH_CMD" | grep -qE '^(rg|grep)[[:space:]]+'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(rg|grep) /rtk grep /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(rg|grep) /rtk grep /')")"
 elif echo "$MATCH_CMD" | grep -qE '^ls([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^ls/rtk ls/')"
-elif echo "$MATCH_CMD" | grep -qE '^tree([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^tree/rtk tree/')"
-elif echo "$MATCH_CMD" | grep -qE '^find[[:space:]]+'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^find /rtk find /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^ls/rtk ls/')")"
 elif echo "$MATCH_CMD" | grep -qE '^diff[[:space:]]+'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^diff /rtk diff /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^diff /rtk diff /')")"
 elif echo "$MATCH_CMD" | grep -qE '^head[[:space:]]+'; then
   # Transform: head -N file → rtk read file --max-lines N
   # Also handle: head --lines=N file
   if echo "$MATCH_CMD" | grep -qE '^head[[:space:]]+-[0-9]+[[:space:]]+'; then
     LINES=$(echo "$MATCH_CMD" | sed -E 's/^head +-([0-9]+) +.+$/\1/')
     FILE=$(echo "$MATCH_CMD" | sed -E 's/^head +-[0-9]+ +(.+)$/\1/')
-    REWRITTEN="${ENV_PREFIX}rtk read $FILE --max-lines $LINES"
+    REWRITTEN="$(rewrite_with_context "rtk read $FILE --max-lines $LINES")"
   elif echo "$MATCH_CMD" | grep -qE '^head[[:space:]]+--lines=[0-9]+[[:space:]]+'; then
     LINES=$(echo "$MATCH_CMD" | sed -E 's/^head +--lines=([0-9]+) +.+$/\1/')
     FILE=$(echo "$MATCH_CMD" | sed -E 's/^head +--lines=[0-9]+ +(.+)$/\1/')
-    REWRITTEN="${ENV_PREFIX}rtk read $FILE --max-lines $LINES"
+    REWRITTEN="$(rewrite_with_context "rtk read $FILE --max-lines $LINES")"
   fi
 
 # --- JS/TS tooling (added: npm run, npm test, vue-tsc) ---
 elif echo "$MATCH_CMD" | grep -qE '^(pnpm[[:space:]]+)?(npx[[:space:]]+)?vitest([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(pnpm )?(npx )?vitest( run)?/rtk vitest run/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(pnpm )?(npx )?vitest( run)?/rtk vitest run/')")"
 elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+test([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pnpm test/rtk vitest run/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm test/rtk vitest run/')")"
 elif echo "$MATCH_CMD" | grep -qE '^npm[[:space:]]+test([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^npm test/rtk npm test/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^npm test/rtk npm test/')")"
 elif echo "$MATCH_CMD" | grep -qE '^npm[[:space:]]+run[[:space:]]+'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^npm run /rtk npm /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^npm run /rtk npm /')")"
 elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?vue-tsc([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx )?vue-tsc/rtk tsc/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?vue-tsc/rtk tsc/')")"
 elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+tsc([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pnpm tsc/rtk tsc/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm tsc/rtk tsc/')")"
 elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?tsc([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx )?tsc/rtk tsc/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?tsc/rtk tsc/')")"
 elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+lint([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pnpm lint/rtk lint/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm lint/rtk lint/')")"
 elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?eslint([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx )?eslint/rtk lint/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?eslint/rtk lint/')")"
 elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?prettier([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx )?prettier/rtk prettier/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?prettier/rtk prettier/')")"
 elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?playwright([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx )?playwright/rtk playwright/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?playwright/rtk playwright/')")"
 elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+playwright([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pnpm playwright/rtk playwright/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm playwright/rtk playwright/')")"
 elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?prisma([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx )?prisma/rtk prisma/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?prisma/rtk prisma/')")"
 
 # --- Containers (added: docker compose, docker run/build/exec, kubectl describe/apply) ---
 elif echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]+compose([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^docker /rtk docker /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^docker /rtk docker /')")"
 elif echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]+(ps|images|logs|run|build|exec)([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^docker /rtk docker /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^docker /rtk docker /')")"
 elif echo "$MATCH_CMD" | grep -qE '^kubectl[[:space:]]+(get|logs|describe|apply)([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^kubectl /rtk kubectl /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^kubectl /rtk kubectl /')")"
 
 # --- Network ---
 elif echo "$MATCH_CMD" | grep -qE '^curl[[:space:]]+'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^curl /rtk curl /')"
-elif echo "$MATCH_CMD" | grep -qE '^wget[[:space:]]+'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^wget /rtk wget /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^curl /rtk curl /')")"
 
 # --- pnpm package management ---
 elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+(list|ls|outdated)([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pnpm /rtk pnpm /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm /rtk pnpm /')")"
 
 # --- Python tooling ---
 elif echo "$MATCH_CMD" | grep -qE '^pytest([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pytest/rtk pytest/')"
-elif echo "$MATCH_CMD" | grep -qE '^python[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^python -m pytest/rtk pytest/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pytest/rtk pytest/')")"
+elif echo "$MATCH_CMD" | grep -qE '^python(3)?[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; then
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^python3? -m pytest/rtk pytest/')")"
 elif echo "$MATCH_CMD" | grep -qE '^ruff[[:space:]]+(check|format)([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^ruff /rtk ruff /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^ruff /rtk ruff /')")"
+elif echo "$MATCH_CMD" | grep -qE '^python(3)?[[:space:]]+-m[[:space:]]+ruff([[:space:]]|$)'; then
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^python3? -m ruff/rtk ruff/')")"
 elif echo "$MATCH_CMD" | grep -qE '^pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pip /rtk pip /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pip /rtk pip /')")"
 elif echo "$MATCH_CMD" | grep -qE '^uv[[:space:]]+pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^uv pip /rtk pip /')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^uv pip /rtk pip /')")"
 
 # --- Go tooling ---
 elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+test([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^go test/rtk go test/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^go test/rtk go test/')")"
 elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+build([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^go build/rtk go build/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^go build/rtk go build/')")"
 elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+vet([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^go vet/rtk go vet/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^go vet/rtk go vet/')")"
 elif echo "$MATCH_CMD" | grep -qE '^golangci-lint([[:space:]]|$)'; then
-  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^golangci-lint/rtk golangci-lint/')"
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^golangci-lint/rtk golangci-lint/')")"
 fi
 
 # If no rewrite needed, approve as-is
