@@ -4,7 +4,15 @@
 #
 # Usage: bash ~/.claude/hooks/test-rtk-rewrite.sh
 
-HOOK="$HOME/.claude/hooks/rtk-rewrite.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK="${HOOK:-$HOME/.claude/hooks/rtk-rewrite.sh}"
+if [ ! -f "$HOOK" ]; then
+  HOOK="$SCRIPT_DIR/../.claude/hooks/rtk-rewrite.sh"
+fi
+if [ ! -f "$HOOK" ]; then
+  HOOK="$SCRIPT_DIR/rtk-rewrite.sh"
+fi
+RTK_BIN="$(command -v rtk 2>/dev/null || echo rtk)"
 PASS=0
 FAIL=0
 TOTAL=0
@@ -24,7 +32,7 @@ test_rewrite() {
   local input_json
   input_json=$(jq -n --arg cmd "$input_cmd" '{"tool_name":"Bash","tool_input":{"command":$cmd}}')
   local output
-  output=$(echo "$input_json" | bash "$HOOK" 2>/dev/null) || true
+  output=$(echo "$input_json" | RTK_BIN="$RTK_BIN" bash "$HOOK" 2>/dev/null) || true
 
   if [ -z "$expected_cmd" ]; then
     # Expect no rewrite (hook exits 0 with no output)
@@ -148,6 +156,18 @@ test_rewrite "env + npm run" \
 test_rewrite "env + docker compose" \
   "COMPOSE_PROJECT_NAME=test docker compose up -d" \
   "COMPOSE_PROJECT_NAME=test rtk docker compose up -d"
+
+test_rewrite "uv run pytest wrapper" \
+  "uv run pytest tests/ -q" \
+  "uv run $RTK_BIN pytest tests/ -q"
+
+test_rewrite "uv run python -m pytest wrapper" \
+  "uv run python -m pytest tests/ -q" \
+  "uv run $RTK_BIN pytest tests/ -q"
+
+test_rewrite "wrapped already-rtk should not rewrite" \
+  "uv run rtk git status" \
+  ""
 
 echo ""
 

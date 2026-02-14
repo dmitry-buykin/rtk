@@ -66,10 +66,13 @@ const PATTERNS: &[&str] = &[
     r"^(pnpm\s+|npx\s+)?(vitest|jest|test)(\s|$)",
     r"^(npx\s+|pnpm\s+)?playwright",
     r"^(npx\s+|pnpm\s+)?prisma",
-    r"^docker\s+(ps|images|logs)",
-    r"^kubectl\s+(get|logs)",
+    r"^docker\s+(compose|ps|images|logs|run|build|exec)(\s|$)",
+    r"^kubectl\s+(get|logs|describe|apply)(\s|$)",
     r"^curl\s+",
     r"^wget\s+",
+    r"^(python(3)?\s+-m\s+)?pytest(\s|$)",
+    r"^(python(3)?\s+-m\s+)?ruff(\s|$)",
+    r"^pip\s+(list|outdated|install|show)(\s|$)",
 ];
 
 const RULES: &[RtkRule] = &[
@@ -225,6 +228,27 @@ const RULES: &[RtkRule] = &[
         subcmd_savings: &[],
         subcmd_status: &[],
     },
+    RtkRule {
+        rtk_cmd: "rtk pytest",
+        category: "Tests",
+        savings_pct: 90.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk ruff",
+        category: "Build",
+        savings_pct: 84.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk pip",
+        category: "PackageManager",
+        savings_pct: 70.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
 ];
 
 /// Commands to ignore (shell builtins, trivial, already rtk).
@@ -292,6 +316,17 @@ lazy_static! {
         .collect();
     static ref ENV_PREFIX: Regex =
         Regex::new(r"^(?:sudo\s+|env\s+|[A-Z_][A-Z0-9_]*=[^\s]*\s+)+").unwrap();
+    static ref RUNNER_PREFIX: Regex = Regex::new(
+        r"^(?:(?:uv|poetry|pipenv|hatch|rye)\s+run\s+|(?:npm|pnpm)\s+exec(?:\s+--)?\s+)"
+    )
+    .unwrap();
+}
+
+fn is_ignored_command(cmd: &str) -> bool {
+    if IGNORED_EXACT.contains(&cmd) {
+        return true;
+    }
+    IGNORED_PREFIXES.iter().any(|prefix| cmd.starts_with(prefix))
 }
 
 /// Classify a single (already-split) command.
@@ -301,22 +336,19 @@ pub fn classify_command(cmd: &str) -> Classification {
         return Classification::Ignored;
     }
 
-    // Check ignored
-    for exact in IGNORED_EXACT {
-        if trimmed == *exact {
-            return Classification::Ignored;
-        }
-    }
-    for prefix in IGNORED_PREFIXES {
-        if trimmed.starts_with(prefix) {
-            return Classification::Ignored;
-        }
+    if is_ignored_command(trimmed) {
+        return Classification::Ignored;
     }
 
     // Strip env prefixes (sudo, env VAR=val, VAR=val)
-    let stripped = ENV_PREFIX.replace(trimmed, "");
-    let cmd_clean = stripped.trim();
+    let stripped_env = ENV_PREFIX.replace(trimmed, "");
+    // Strip runner wrappers so wrapped commands classify the same way.
+    let stripped_runner = RUNNER_PREFIX.replace(stripped_env.trim(), "");
+    let cmd_clean = stripped_runner.trim();
     if cmd_clean.is_empty() {
+        return Classification::Ignored;
+    }
+    if is_ignored_command(cmd_clean) {
         return Classification::Ignored;
     }
 
@@ -657,6 +689,79 @@ mod tests {
                 rtk_equivalent: "rtk cargo",
                 category: "Cargo",
                 estimated_savings_pct: 80.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_runner_wrapped_pytest() {
+        assert_eq!(
+            classify_command("uv run python -m pytest tests/ -q"),
+            Classification::Supported {
+                rtk_equivalent: "rtk pytest",
+                category: "Tests",
+                estimated_savings_pct: 90.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_runner_wrapped_ruff() {
+        assert_eq!(
+            classify_command("poetry run ruff check ."),
+            Classification::Supported {
+                rtk_equivalent: "rtk ruff",
+                category: "Build",
+                estimated_savings_pct: 84.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_runner_wrapped_already_rtk_ignored() {
+        assert_eq!(
+            classify_command("uv run rtk git status"),
+            Classification::Ignored
+        );
+    }
+
+    #[test]
+    fn test_classify_npm_exec_eslint() {
+        assert_eq!(
+            classify_command("npm exec -- eslint ."),
+            Classification::Supported {
+                rtk_equivalent: "rtk lint",
+                category: "Build",
+                estimated_savings_pct: 84.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_docker_compose() {
+        assert_eq!(
+            classify_command("docker compose up -d"),
+            Classification::Supported {
+                rtk_equivalent: "rtk docker",
+                category: "Infra",
+                estimated_savings_pct: 85.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_kubectl_describe() {
+        assert_eq!(
+            classify_command("kubectl describe pod app"),
+            Classification::Supported {
+                rtk_equivalent: "rtk kubectl",
+                category: "Infra",
+                estimated_savings_pct: 85.0,
                 status: RtkStatus::Existing,
             }
         );
