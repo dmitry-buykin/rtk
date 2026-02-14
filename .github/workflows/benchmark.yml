@@ -13,6 +13,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: stable
 
       - name: Build rtk
         run: cargo build --release
