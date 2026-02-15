@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 /// RTK support status for a command.
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RtkStatus {
     /// Dedicated handler with filtering (e.g., git status → git.rs:run_status())
     Existing,

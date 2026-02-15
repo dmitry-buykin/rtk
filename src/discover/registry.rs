@@ -40,6 +40,9 @@ pub fn category_avg_tokens(category: &str, subcmd: &str) -> usize {
         "Files" => 100,
         "Build" => 300,
         "Infra" => 120,
+        "Cloud" => 220,
+        "Data" => 260,
+        "Scripts" => 180,
         "Network" => 150,
         "GitHub" => 200,
         "PackageManager" => 150,
@@ -68,8 +71,12 @@ const PATTERNS: &[&str] = &[
     r"^(npx\s+|pnpm\s+)?prisma",
     r"^docker\s+(compose|ps|images|logs|run|build|exec)(\s|$)",
     r"^kubectl\s+(get|logs|describe|apply)(\s|$)",
+    r"^gcloud(\s|$)",
+    r"^bq(\s|$)",
+    r"^sqlite3(\s|$)",
     r"^curl\s+",
     r"^wget\s+",
+    r"^python(3)?(\s|$)",
     r"^(python(3)?\s+-m\s+)?pytest(\s|$)",
     r"^(python(3)?\s+-m\s+)?ruff(\s|$)",
     r"^pip\s+(list|outdated|install|show)(\s|$)",
@@ -215,6 +222,27 @@ const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
+        rtk_cmd: "rtk proxy gcloud",
+        category: "Cloud",
+        savings_pct: 0.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk proxy bq",
+        category: "Data",
+        savings_pct: 0.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk proxy sqlite3",
+        category: "Data",
+        savings_pct: 0.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
         rtk_cmd: "rtk curl",
         category: "Network",
         savings_pct: 70.0,
@@ -225,6 +253,13 @@ const RULES: &[RtkRule] = &[
         rtk_cmd: "rtk wget",
         category: "Network",
         savings_pct: 65.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk proxy python",
+        category: "Scripts",
+        savings_pct: 0.0,
         subcmd_savings: &[],
         subcmd_status: &[],
     },
@@ -253,6 +288,9 @@ const RULES: &[RtkRule] = &[
 
 /// Commands to ignore (shell builtins, trivial, already rtk).
 const IGNORED_PREFIXES: &[&str] = &[
+    "#",
+    "//",
+    "```",
     "cd ",
     "cd\t",
     "echo ",
@@ -320,6 +358,7 @@ lazy_static! {
         r"^(?:(?:uv|poetry|pipenv|hatch|rye)\s+run\s+|(?:npm|pnpm)\s+exec(?:\s+--)?\s+)"
     )
     .unwrap();
+    static ref BARE_ENV_TOKEN: Regex = Regex::new(r"^[A-Z_][A-Z0-9_]*$").unwrap();
 }
 
 fn is_ignored_command(cmd: &str) -> bool {
@@ -329,19 +368,83 @@ fn is_ignored_command(cmd: &str) -> bool {
     IGNORED_PREFIXES.iter().any(|prefix| cmd.starts_with(prefix))
 }
 
+fn normalize_command_for_classification(cmd: &str) -> Option<String> {
+    let mut normalized = cmd.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    // For multiline snippets, keep only the first meaningful line.
+    if normalized.contains('\n') {
+        normalized = normalized
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                !line.is_empty()
+                    && !line.starts_with('#')
+                    && !line.starts_with("//")
+                    && !line.starts_with("```")
+            })
+            .unwrap_or("");
+    }
+
+    if normalized.is_empty() {
+        return None;
+    }
+
+    // Strip common shell prompt markers.
+    loop {
+        let stripped = if let Some(rest) = normalized.strip_prefix("$ ") {
+            Some(rest)
+        } else if let Some(rest) = normalized.strip_prefix("% ") {
+            Some(rest)
+        } else if let Some(rest) = normalized.strip_prefix("> ") {
+            Some(rest)
+        } else {
+            None
+        };
+
+        if let Some(rest) = stripped {
+            normalized = rest.trim_start();
+        } else {
+            break;
+        }
+    }
+
+    // Allow escaped command names like "\ cp file".
+    if let Some(rest) = normalized.strip_prefix('\\') {
+        normalized = rest.trim_start();
+    }
+
+    if normalized.is_empty() {
+        return None;
+    }
+
+    // Noise guard: bare env-like symbol (e.g., ADMIN_TOKEN) is not a command.
+    if BARE_ENV_TOKEN.is_match(normalized) {
+        return None;
+    }
+
+    Some(normalized.to_string())
+}
+
 /// Classify a single (already-split) command.
 pub fn classify_command(cmd: &str) -> Classification {
-    let trimmed = cmd.trim();
-    if trimmed.is_empty() {
+    let normalized = match normalize_command_for_classification(cmd) {
+        Some(c) => c,
+        None => return Classification::Ignored,
+    };
+
+    if normalized.is_empty() {
         return Classification::Ignored;
     }
 
-    if is_ignored_command(trimmed) {
+    if is_ignored_command(&normalized) {
         return Classification::Ignored;
     }
 
     // Strip env prefixes (sudo, env VAR=val, VAR=val)
-    let stripped_env = ENV_PREFIX.replace(trimmed, "");
+    let stripped_env = ENV_PREFIX.replace(&normalized, "");
     // Strip runner wrappers so wrapped commands classify the same way.
     let stripped_runner = RUNNER_PREFIX.replace(stripped_env.trim(), "");
     let cmd_clean = stripped_runner.trim();
@@ -367,7 +470,13 @@ pub fn classify_command(cmd: &str) -> Classification {
                     .iter()
                     .find(|(s, _)| *s == subcmd)
                     .map(|(_, st)| *st)
-                    .unwrap_or(super::report::RtkStatus::Existing);
+                    .unwrap_or_else(|| {
+                        if rule.rtk_cmd.starts_with("rtk proxy ") {
+                            super::report::RtkStatus::Passthrough
+                        } else {
+                            super::report::RtkStatus::Existing
+                        }
+                    });
 
                 // Check if this subcommand has custom savings
                 let savings = rule
@@ -382,7 +491,12 @@ pub fn classify_command(cmd: &str) -> Classification {
                 (rule.savings_pct, super::report::RtkStatus::Existing)
             }
         } else {
-            (rule.savings_pct, super::report::RtkStatus::Existing)
+            let status = if rule.rtk_cmd.starts_with("rtk proxy ") {
+                super::report::RtkStatus::Passthrough
+            } else {
+                super::report::RtkStatus::Existing
+            };
+            (rule.savings_pct, status)
         };
 
         Classification::Supported {
@@ -495,6 +609,19 @@ pub fn split_command_chain(cmd: &str) -> Vec<&str> {
                 start = i;
             }
             b';' if !in_single && !in_double => {
+                let segment = trimmed[start..i].trim();
+                if !segment.is_empty() {
+                    results.push(segment);
+                }
+                i += 1;
+                start = i;
+            }
+            b'\n' | b'\r' if !in_single && !in_double => {
+                // Respect line continuation with trailing backslash.
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    i += 1;
+                    continue;
+                }
                 let segment = trimmed[start..i].trim();
                 if !segment.is_empty() {
                     results.push(segment);
@@ -768,6 +895,76 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_gcloud_supported_passthrough() {
+        assert_eq!(
+            classify_command("gcloud run services list"),
+            Classification::Supported {
+                rtk_equivalent: "rtk proxy gcloud",
+                category: "Cloud",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_bq_supported_passthrough() {
+        assert_eq!(
+            classify_command("bq query --nouse_legacy_sql 'select 1'"),
+            Classification::Supported {
+                rtk_equivalent: "rtk proxy bq",
+                category: "Data",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_sqlite3_supported_passthrough() {
+        assert_eq!(
+            classify_command("sqlite3 app.db '.tables'"),
+            Classification::Supported {
+                rtk_equivalent: "rtk proxy sqlite3",
+                category: "Data",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_runner_wrapped_python_passthrough() {
+        assert_eq!(
+            classify_command("uv run python scripts/audit.py"),
+            Classification::Supported {
+                rtk_equivalent: "rtk proxy python",
+                category: "Scripts",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_noise_comment_ignored() {
+        assert_eq!(classify_command("# Check credentials"), Classification::Ignored);
+    }
+
+    #[test]
+    fn test_classify_noise_bare_env_symbol_ignored() {
+        assert_eq!(classify_command("ADMIN_TOKEN"), Classification::Ignored);
+    }
+
+    #[test]
+    fn test_classify_escaped_cp_ignored() {
+        assert_eq!(
+            classify_command("\\ cp source.txt target.txt"),
+            Classification::Ignored
+        );
+    }
+
+    #[test]
     fn test_patterns_rules_length_match() {
         assert_eq!(
             PATTERNS.len(),
@@ -836,5 +1033,18 @@ mod tests {
     fn test_split_heredoc_no_split() {
         let cmd = "cat <<'EOF'\nhello && world\nEOF";
         assert_eq!(split_command_chain(cmd), vec![cmd]);
+    }
+
+    #[test]
+    fn test_split_newline() {
+        assert_eq!(split_command_chain("git status\nls -la"), vec!["git status", "ls -la"]);
+    }
+
+    #[test]
+    fn test_split_newline_with_line_continuation() {
+        assert_eq!(
+            split_command_chain("echo hello \\\nworld"),
+            vec!["echo hello \\\nworld"]
+        );
     }
 }

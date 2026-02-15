@@ -1027,7 +1027,7 @@ pub fn track(original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
     }
 }
 
-fn sanitize_command_for_tracking(command: &str) -> String {
+pub(crate) fn sanitize_command_for_tracking(command: &str) -> String {
     if command.is_empty() {
         return String::new();
     }
