@@ -5,6 +5,7 @@ mod report;
 use anyhow::Result;
 use std::collections::HashMap;
 
+use crate::tracking::sanitize_command_for_tracking;
 use provider::{ClaudeProvider, SessionProvider};
 use registry::{category_avg_tokens, classify_command, split_command_chain, Classification};
 use report::{DiscoverReport, SupportedEntry, UnsupportedEntry};
@@ -17,7 +18,7 @@ struct SupportedBucket {
     total_output_tokens: usize,
     savings_pct: f64,
     // For display: the most common raw command
-    command_counts: HashMap<String, usize>,
+    command_counts: HashMap<(String, report::RtkStatus), usize>,
 }
 
 /// Aggregation bucket for unsupported commands.
@@ -116,10 +117,11 @@ pub fn run(
                         bucket.total_output_tokens += savings;
 
                         // Track the display name with status
-                        let display_name = truncate_command(part);
+                        let redacted = sanitize_command_for_tracking(part);
+                        let display_name = truncate_command(&redacted);
                         let entry = bucket
                             .command_counts
-                            .entry(format!("{}:{:?}", display_name, status))
+                            .entry((display_name, status))
                             .or_insert(0);
                         *entry += 1;
                     }
@@ -127,7 +129,7 @@ pub fn run(
                         let bucket = unsupported_map.entry(base_command).or_insert_with(|| {
                             UnsupportedBucket {
                                 count: 0,
-                                example: part.to_string(),
+                                example: sanitize_command_for_tracking(part),
                             }
                         });
                         bucket.count += 1;
@@ -153,21 +155,7 @@ pub fn run(
                 .command_counts
                 .into_iter()
                 .max_by_key(|(_, c)| *c)
-                .map(|(name, _)| {
-                    // Extract status from "command:Status" format
-                    if let Some(colon_pos) = name.rfind(':') {
-                        let cmd = name[..colon_pos].to_string();
-                        let status_str = &name[colon_pos + 1..];
-                        let status = match status_str {
-                            "Passthrough" => report::RtkStatus::Passthrough,
-                            "NotSupported" => report::RtkStatus::NotSupported,
-                            _ => report::RtkStatus::Existing,
-                        };
-                        (cmd, status)
-                    } else {
-                        (name, report::RtkStatus::Existing)
-                    }
-                })
+                .map(|((name, status), _)| (name, status))
                 .unwrap_or_else(|| (String::new(), report::RtkStatus::Existing));
 
             SupportedEntry {

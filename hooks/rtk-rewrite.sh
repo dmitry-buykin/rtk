@@ -190,6 +190,14 @@ elif echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]+(ps|images|logs|run|build|
 elif echo "$MATCH_CMD" | grep -qE '^kubectl[[:space:]]+(get|logs|describe|apply)([[:space:]]|$)'; then
   REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^kubectl /rtk kubectl /')")"
 
+# --- Cloud/Data passthrough wrappers ---
+elif echo "$MATCH_CMD" | grep -qE '^gcloud([[:space:]]|$)'; then
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^gcloud([[:space:]]|$)/rtk proxy gcloud\1/')")"
+elif echo "$MATCH_CMD" | grep -qE '^bq([[:space:]]|$)'; then
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^bq([[:space:]]|$)/rtk proxy bq\1/')")"
+elif echo "$MATCH_CMD" | grep -qE '^sqlite3([[:space:]]|$)'; then
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^sqlite3([[:space:]]|$)/rtk proxy sqlite3\1/')")"
+
 # --- Network ---
 elif echo "$MATCH_CMD" | grep -qE '^curl[[:space:]]+'; then
   REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^curl /rtk curl /')")"
@@ -207,6 +215,8 @@ elif echo "$MATCH_CMD" | grep -qE '^ruff[[:space:]]+(check|format)([[:space:]]|$
   REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^ruff /rtk ruff /')")"
 elif echo "$MATCH_CMD" | grep -qE '^python(3)?[[:space:]]+-m[[:space:]]+ruff([[:space:]]|$)'; then
   REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^python3? -m ruff/rtk ruff/')")"
+elif echo "$MATCH_CMD" | grep -qE '^python(3)?([[:space:]]|$)'; then
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^python3?/rtk proxy python/')")"
 elif echo "$MATCH_CMD" | grep -qE '^pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
   REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pip /rtk pip /')")"
 elif echo "$MATCH_CMD" | grep -qE '^uv[[:space:]]+pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
