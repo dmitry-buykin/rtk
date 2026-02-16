@@ -412,6 +412,13 @@ rewrite_segment() {
     return
   fi
 
+  # Skip segments that contain unquoted I/O operators (pipes/redirections).
+  # These commands are often used for diagnostics and must preserve exact shell behavior.
+  if has_unquoted_io_operator "$segment"; then
+    printf "%s" "$segment"
+    return
+  fi
+
   local leading_ws core trailing_ws
   leading_ws="${segment%%[![:space:]]*}"
   core="${segment#$leading_ws}"
@@ -442,6 +449,64 @@ rewrite_segment() {
 
 CHAIN_SEGMENTS=()
 CHAIN_SEPARATORS=()
+
+has_unquoted_io_operator() {
+  local input="$1"
+  local len=${#input}
+  local i=0
+  local in_single=0
+  local in_double=0
+  local escaped=0
+
+  while [ $i -lt $len ]; do
+    local ch="${input:i:1}"
+    local two="${input:i:2}"
+
+    if [ $escaped -eq 1 ]; then
+      escaped=0
+      i=$((i + 1))
+      continue
+    fi
+
+    if [[ "$ch" == "\\" && $in_single -eq 0 ]]; then
+      escaped=1
+      i=$((i + 1))
+      continue
+    fi
+
+    if [[ "$ch" == "'" && $in_double -eq 0 ]]; then
+      in_single=$((1 - in_single))
+      i=$((i + 1))
+      continue
+    fi
+
+    if [[ "$ch" == '"' && $in_single -eq 0 ]]; then
+      in_double=$((1 - in_double))
+      i=$((i + 1))
+      continue
+    fi
+
+    if [ $in_single -eq 0 ] && [ $in_double -eq 0 ]; then
+      case "$ch" in
+        '<'|'>')
+          return 0
+          ;;
+        '|')
+          # Logical OR is handled by chain splitting; only treat single pipe as I/O.
+          if [[ "$two" == "||" ]]; then
+            i=$((i + 2))
+            continue
+          fi
+          return 0
+          ;;
+      esac
+    fi
+
+    i=$((i + 1))
+  done
+
+  return 1
+}
 
 split_chain_with_separators() {
   local input="$1"

@@ -311,6 +311,18 @@ test_rewrite "node (no pattern)" \
   "node -e 'console.log(1)'" \
   ""
 
+test_rewrite "pytest with stderr redirect (no rewrite)" \
+  "uv run pytest tests/test_admin_force_resync.py --collect-only 2>&1" \
+  ""
+
+test_rewrite "pytest piped to tail (no rewrite)" \
+  "uv run python -m pytest tests/test_admin_force_resync.py -v --tb=long 2>&1 | tail -40" \
+  ""
+
+test_rewrite "git status with file redirect (no rewrite)" \
+  "git status > /tmp/git-status.txt" \
+  ""
+
 echo ""
 
 # ---- SUMMARY ----
