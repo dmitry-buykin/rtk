@@ -129,6 +129,8 @@ elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+check([[:space:]]|$)'; then
   REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo check/rtk cargo check/')")"
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+install([[:space:]]|$)'; then
   REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo install/rtk cargo install/')")"
+elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+nextest([[:space:]]|$)'; then
+  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo nextest/rtk cargo nextest/')")"
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+fmt([[:space:]]|$)'; then
   REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo fmt/rtk cargo fmt/')")"
 

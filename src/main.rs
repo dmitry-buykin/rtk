@@ -11,6 +11,7 @@ mod display_helpers;
 mod env_cmd;
 mod filter;
 mod find_cmd;
+mod format_cmd;
 mod gain;
 mod gh_cmd;
 mod git;
@@ -389,6 +390,13 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Universal format checker (prettier, black, ruff format)
+    Format {
+        /// Formatter arguments (auto-detects formatter from project files)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Playwright E2E tests with compact output
     Playwright {
         /// Playwright arguments
@@ -760,6 +768,12 @@ enum CargoCommands {
     /// Install with compact output (strip dep compilation, keep installed/errors)
     Install {
         /// Additional cargo install arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Nextest with failures-only output
+    Nextest {
+        /// Additional cargo nextest arguments (e.g., run, list, --lib)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -1165,6 +1179,10 @@ fn main() -> Result<()> {
             prettier_cmd::run(&args, cli.verbose)?;
         }
 
+        Commands::Format { args } => {
+            format_cmd::run(&args, cli.verbose)?;
+        }
+
         Commands::Playwright { args } => {
             playwright_cmd::run(&args, cli.verbose)?;
         }
@@ -1184,6 +1202,9 @@ fn main() -> Result<()> {
             }
             CargoCommands::Install { args } => {
                 cargo_cmd::run(cargo_cmd::CargoCommand::Install, &args, cli.verbose)?;
+            }
+            CargoCommands::Nextest { args } => {
+                cargo_cmd::run(cargo_cmd::CargoCommand::Nextest, &args, cli.verbose)?;
             }
             CargoCommands::Other(args) => {
                 cargo_cmd::run_passthrough(&args, cli.verbose)?;

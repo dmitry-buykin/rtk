@@ -147,7 +147,7 @@ rewrite_inner() {
       ;;
     cargo)
       case "$second" in
-        test|build|clippy|check|install|fmt)
+        test|build|clippy|check|install|nextest|fmt)
           printf "%s %s" "$RTK_CMD" "$cmd_trimmed"
           return
           ;;
