@@ -367,6 +367,50 @@ fn print_manual_instructions(hook_command: &str) {
     println!("\n  Then restart Claude Code. Test with: git status\n");
 }
 
+fn unquote_shell_token(token: &str) -> &str {
+    token
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| token.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(token)
+}
+
+fn extract_hook_path_from_command(command: &str) -> Option<String> {
+    let token = command.split_whitespace().last()?;
+    let token = unquote_shell_token(token);
+    if token.ends_with("rtk-rewrite.sh") {
+        Some(token.to_string())
+    } else {
+        None
+    }
+}
+
+fn normalize_hook_path(path: &str) -> String {
+    let path = unquote_shell_token(path);
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    PathBuf::from(path).to_string_lossy().to_string()
+}
+
+fn ensure_local_claude_md_not_symlink(path: &Path, global: bool) -> Result<()> {
+    if global || !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "Refusing to modify symlinked {} in local mode. Use a regular file for CLAUDE.md.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Remove RTK hook entry from settings.json
 /// Returns true if hook was found and removed
 fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
@@ -657,6 +701,9 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) {
 /// Check if RTK hook is already present in settings.json
 /// Matches on rtk-rewrite.sh substring to handle different path formats
 fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
+    let expected_hook_path = extract_hook_path_from_command(hook_command)
+        .map(|path| normalize_hook_path(&path));
+
     let pre_tool_use_array = match root
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
@@ -672,9 +719,18 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
         .flatten()
         .filter_map(|hook| hook.get("command")?.as_str())
         .any(|cmd| {
-            // Exact match OR both contain rtk-rewrite.sh
-            cmd == hook_command
-                || (cmd.contains("rtk-rewrite.sh") && hook_command.contains("rtk-rewrite.sh"))
+            if cmd == hook_command {
+                return true;
+            }
+
+            let Some(expected) = expected_hook_path.as_ref() else {
+                return false;
+            };
+            let Some(existing) = extract_hook_path_from_command(cmd) else {
+                return false;
+            };
+
+            normalize_hook_path(&existing) == *expected
         })
 }
 
@@ -804,6 +860,8 @@ fn run_claude_md_mode(global: bool, verbose: u8) -> Result<()> {
     if verbose > 0 {
         eprintln!("Writing rtk instructions to: {}", path.display());
     }
+
+    ensure_local_claude_md_not_symlink(&path, global)?;
 
     if path.exists() {
         let existing = fs::read_to_string(&path)?;
