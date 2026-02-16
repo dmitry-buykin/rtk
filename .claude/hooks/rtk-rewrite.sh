@@ -3,11 +3,24 @@
 # Transparently rewrites raw commands to their rtk equivalents.
 # Outputs JSON with updatedInput to modify the command before execution.
 
+# --- Audit logging (opt-in via RTK_HOOK_AUDIT=1) ---
+_rtk_audit_log() {
+  if [ "${RTK_HOOK_AUDIT:-0}" != "1" ]; then return; fi
+  local action="$1" original="$2" rewritten="${3:--}"
+  local dir="${RTK_AUDIT_DIR:-${HOME}/.local/share/rtk}"
+  mkdir -p "$dir"
+  printf '%s | %s | %s | %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action" "$original" "$rewritten" \
+    >> "${dir}/hook-audit.log"
+}
+
 # Guards: skip silently if dependencies missing
 if ! command -v jq &>/dev/null; then
+  _rtk_audit_log "skip:no_deps" "-"
   exit 0
 fi
 if [ -z "${RTK_BIN:-}" ] && ! command -v rtk &>/dev/null; then
+  _rtk_audit_log "skip:no_deps" "-"
   exit 0
 fi
 
@@ -18,6 +31,7 @@ INPUT=$(cat)
 CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
 if [ -z "$CMD" ]; then
+  _rtk_audit_log "skip:empty" "-"
   exit 0
 fi
 
@@ -27,12 +41,12 @@ FIRST_CMD="$CMD"
 
 # Skip if already using rtk
 case "$FIRST_CMD" in
-  rtk\ *|*/rtk\ *) exit 0 ;;
+  rtk\ *|*/rtk\ *) _rtk_audit_log "skip:already_rtk" "$CMD"; exit 0 ;;
 esac
 
 # Skip commands with heredocs, variable assignments as the whole command, etc.
 case "$FIRST_CMD" in
-  *'<<'*) exit 0 ;;
+  *'<<'*) _rtk_audit_log "skip:heredoc" "$CMD"; exit 0 ;;
 esac
 
 # Strip leading env var assignments for pattern matching
@@ -227,8 +241,11 @@ fi
 
 # If no rewrite needed, approve as-is
 if [ -z "$REWRITTEN" ]; then
+  _rtk_audit_log "skip:no_match" "$CMD"
   exit 0
 fi
+
+_rtk_audit_log "rewrite" "$CMD" "$REWRITTEN"
 
 # Build the updated tool_input with all original fields preserved, only command changed
 ORIGINAL_INPUT=$(echo "$INPUT" | jq -c '.tool_input')
