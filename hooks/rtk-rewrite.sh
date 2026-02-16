@@ -267,6 +267,11 @@ rewrite_inner() {
       fi
       ;;
     python|python3)
+      if [[ "$second" == "-c" ]]; then
+        # Inline Python snippets are often diagnostics/wrappers; keep raw behavior.
+        printf ""
+        return
+      fi
       if [[ "$second" == "-m" && "$third" == "pytest" ]]; then
         printf "%s pytest%s" "$RTK_CMD" "${cmd_trimmed#"$first -m pytest"}"
         return

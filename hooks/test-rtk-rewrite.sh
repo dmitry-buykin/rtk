@@ -307,6 +307,14 @@ test_rewrite "python3 (no pattern)" \
   "python3 script.py" \
   "rtk proxy python3 script.py"
 
+test_rewrite "python -c should not rewrite" \
+  "python -c \"print('hello')\"" \
+  ""
+
+test_rewrite "uv run python -c should not rewrite" \
+  "uv run python -c \"print('hello')\"" \
+  ""
+
 test_rewrite "node (no pattern)" \
   "node -e 'console.log(1)'" \
   ""
