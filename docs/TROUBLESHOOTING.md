@@ -154,7 +154,7 @@ Then add to `~/.claude/settings.json` (replace `~` with full path):
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/yourname/.claude/hooks/rtk-rewrite.sh"
+            "command": "RTK_BIN=/Users/yourname/.cargo/bin/rtk PATH=/Users/yourname/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin /Users/yourname/.claude/hooks/rtk-rewrite.sh"
           }
         ]
       }
@@ -163,7 +163,7 @@ Then add to `~/.claude/settings.json` (replace `~` with full path):
 }
 ```
 
-**Note**: Use absolute path in `settings.json`, not `~/.claude/...`
+**Note**: Use absolute paths (both `RTK_BIN` and hook path), not `~/.claude/...`.
 
 ---
 

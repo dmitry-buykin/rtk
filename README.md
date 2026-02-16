@@ -99,9 +99,9 @@ Download from [rtk-ai/releases](https://github.com/rtk-ai/rtk/releases):
 rtk gain  # Must show token stats, not "command not found"
 
 # 2. Initialize for Claude Code (RECOMMENDED: hook-first mode)
-rtk init --global
+rtk init -g --auto-patch
 # → Installs hook + creates slim RTK.md (10 lines, 99.5% token savings)
-# → Follow printed instructions to add hook to ~/.claude/settings.json
+# → Patches ~/.claude/settings.json automatically (with backup)
 
 # 3. Test it works
 rtk git status  # Should show ultra-compact output
@@ -111,6 +111,8 @@ rtk init --show # Verify hook is installed and executable
 # rtk init --global --claude-md  # Legacy: full injection (137 lines)
 # rtk init                       # Local project only (./CLAUDE.md)
 ```
+
+For a stable Claude Code setup using one shared global hook (no project-local duplication), see `docs/CLAUDE_CODE_SETUP.md`.
 
 **New in v0.9.5**: Hook-first installation eliminates ~2000 tokens from Claude's context while maintaining full RTK functionality through transparent command rewriting.
 
@@ -476,7 +478,7 @@ Add this entry to the `PreToolUse` array in `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/rtk-rewrite.sh"
+            "command": "RTK_BIN=/Users/yourname/.cargo/bin/rtk PATH=/Users/yourname/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin /Users/yourname/.claude/hooks/rtk-rewrite.sh"
           }
         ]
       }
@@ -488,6 +490,8 @@ Add this entry to the `PreToolUse` array in `~/.claude/settings.json`:
 ### Per-Project Install
 
 The hook is included in this repository at `.claude/hooks/rtk-rewrite.sh`. To use it in another project, copy the hook and add the same settings.json entry using a relative path or project-level `.claude/settings.json`.
+
+For most users, prefer one global hook in `~/.claude/settings.json` and remove project-local RTK hook entries to avoid config drift.
 
 ### Commands Rewritten
 
