@@ -13,6 +13,8 @@ fi
 
 set -euo pipefail
 RTK_BIN="${RTK_BIN:-$(command -v rtk)}"
+RTK_CMD="${RTK_BIN}"
+HOOK_MODE="${RTK_HOOK_MODE:-flex}"
 
 INPUT=$(cat)
 CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
@@ -21,217 +23,553 @@ if [ -z "$CMD" ]; then
   exit 0
 fi
 
-# Extract the first meaningful command (before pipes, &&, etc.)
-# We only rewrite if the FIRST command in a chain matches.
-FIRST_CMD="$CMD"
-
-# Skip if already using rtk
-case "$FIRST_CMD" in
-  rtk\ *|*/rtk\ *) exit 0 ;;
+case "$HOOK_MODE" in
+  strict|flex) ;;
+  *) HOOK_MODE="flex" ;;
 esac
 
-# Skip commands with heredocs, variable assignments as the whole command, etc.
-case "$FIRST_CMD" in
-  *'<<'*) exit 0 ;;
-esac
+trim_leading() {
+  local s="$1"
+  printf "%s" "${s#"${s%%[![:space:]]*}"}"
+}
 
-# Strip leading env var assignments for pattern matching
-# e.g., "TEST_SESSION_ID=2 npx playwright test" -> match against "npx playwright test"
-# but preserve them in the rewritten command for execution.
-ENV_PREFIX=$(echo "$FIRST_CMD" | grep -oE '^([A-Za-z_][A-Za-z0-9_]*=[^ ]* +)+' || echo "")
-if [ -n "$ENV_PREFIX" ]; then
-  MATCH_CMD="${FIRST_CMD:${#ENV_PREFIX}}"
-else
-  MATCH_CMD="$FIRST_CMD"
-fi
-CMD_BODY="$MATCH_CMD"
+trim_trailing() {
+  local s="$1"
+  local trailing="${s##*[![:space:]]}"
+  printf "%s" "${s%"$trailing"}"
+}
 
-# Strip common runner wrappers so rules stay generic across projects.
-# Keep runner prefix for final reconstructed command.
-RUNNER_PREFIX=""
-if [[ "$MATCH_CMD" == "uv run "* ]]; then
-  RUNNER_PREFIX="uv run "
-elif [[ "$MATCH_CMD" == "poetry run "* ]]; then
-  RUNNER_PREFIX="poetry run "
-elif [[ "$MATCH_CMD" == "pipenv run "* ]]; then
-  RUNNER_PREFIX="pipenv run "
-elif [[ "$MATCH_CMD" == "hatch run "* ]]; then
-  RUNNER_PREFIX="hatch run "
-elif [[ "$MATCH_CMD" == "rye run "* ]]; then
-  RUNNER_PREFIX="rye run "
-elif [[ "$MATCH_CMD" == "npm exec -- "* ]]; then
-  RUNNER_PREFIX="npm exec -- "
-elif [[ "$MATCH_CMD" == "npm exec "* ]]; then
-  RUNNER_PREFIX="npm exec "
-elif [[ "$MATCH_CMD" == "pnpm exec "* ]]; then
-  RUNNER_PREFIX="pnpm exec "
-fi
+trim() {
+  local s
+  s="$(trim_leading "$1")"
+  trim_trailing "$s"
+}
 
-if [ -n "$RUNNER_PREFIX" ]; then
-  MATCH_CMD="${MATCH_CMD:${#RUNNER_PREFIX}}"
-  CMD_BODY="${CMD_BODY:${#RUNNER_PREFIX}}"
-fi
+is_rtk_command() {
+  local c
+  c="$(trim "$1")"
+  case "$c" in
+    rtk\ *|*/rtk\ *) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-# Skip if command is already routed through rtk after prefix stripping.
-case "$MATCH_CMD" in
-  rtk\ *|*/rtk\ *) exit 0 ;;
-esac
+# Globals populated by strip_prefixes_for_match()
+ENV_PREFIX=""
+PREFIX_CHAIN=""
+MATCH_CMD=""
 
-rewrite_with_context() {
-  local rewritten_inner="$1"
-  if [ -z "$RUNNER_PREFIX" ]; then
-    printf "%s%s" "$ENV_PREFIX" "$rewritten_inner"
+strip_prefixes_for_match() {
+  local segment_core="$1"
+  local current="$segment_core"
+  ENV_PREFIX=""
+  PREFIX_CHAIN=""
+
+  # Strip env-like prefixes (sudo/env/VAR=val), preserving exact spacing.
+  while true; do
+    if [[ "$current" =~ ^([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)(.*)$ ]]; then
+      ENV_PREFIX+="${BASH_REMATCH[1]}"
+      current="${BASH_REMATCH[2]}"
+      continue
+    fi
+    if [[ "$current" =~ ^(env[[:space:]]+)(.*)$ ]]; then
+      ENV_PREFIX+="${BASH_REMATCH[1]}"
+      current="${BASH_REMATCH[2]}"
+      continue
+    fi
+    if [[ "$current" =~ ^(sudo[[:space:]]+)(.*)$ ]]; then
+      ENV_PREFIX+="${BASH_REMATCH[1]}"
+      current="${BASH_REMATCH[2]}"
+      continue
+    fi
+    break
+  done
+
+  # Strip wrappers/runners for pattern matching (preserve for reconstruction).
+  while true; do
+    if [[ "$current" =~ ^((command|builtin)[[:space:]]+)(.*)$ ]]; then
+      PREFIX_CHAIN+="${BASH_REMATCH[1]}"
+      current="${BASH_REMATCH[3]}"
+      continue
+    fi
+
+    if [[ "$current" =~ ^((uv|poetry|pipenv|hatch|rye)[[:space:]]+run[[:space:]]+)(.*)$ ]]; then
+      PREFIX_CHAIN+="${BASH_REMATCH[1]}"
+      current="${BASH_REMATCH[3]}"
+      continue
+    fi
+
+    if [[ "$current" =~ ^((npm[[:space:]]+exec([[:space:]]+--)?[[:space:]]+|pnpm[[:space:]]+exec([[:space:]]+--)?[[:space:]]+))(.*)$ ]]; then
+      PREFIX_CHAIN+="${BASH_REMATCH[1]}"
+      current="${BASH_REMATCH[5]}"
+      continue
+    fi
+
+    break
+  done
+
+  MATCH_CMD="$current"
+}
+
+rewrite_inner() {
+  local cmd="$1"
+  local cmd_trimmed
+  cmd_trimmed="$(trim "$cmd")"
+  if [ -z "$cmd_trimmed" ]; then
+    printf ""
     return
   fi
 
-  # Preserve runner environment, but force absolute rtk binary path for reliability.
-  printf "%s%s%s %s" "$ENV_PREFIX" "$RUNNER_PREFIX" "$RTK_BIN" "${rewritten_inner#rtk }"
-}
-
-REWRITTEN=""
-
-# --- Git commands ---
-if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+status([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git status/rtk git status/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+diff([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git diff/rtk git diff/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+log([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git log/rtk git log/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+add([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git add/rtk git add/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+commit([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git commit/rtk git commit/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+push([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git push/rtk git push/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+pull([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git pull/rtk git pull/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+branch([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git branch/rtk git branch/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+fetch([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git fetch/rtk git fetch/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+stash([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git stash/rtk git stash/')")"
-elif echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+show([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^git show/rtk git show/')")"
-
-# --- GitHub CLI (added: api, release) ---
-elif echo "$MATCH_CMD" | grep -qE '^gh[[:space:]]+(pr|issue|run|api|release)([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^gh /rtk gh /')")"
-
-# --- Cargo ---
-elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+test([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo test/rtk cargo test/')")"
-elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+build([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo build/rtk cargo build/')")"
-elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+clippy([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo clippy/rtk cargo clippy/')")"
-elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+check([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo check/rtk cargo check/')")"
-elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+install([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo install/rtk cargo install/')")"
-elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+fmt([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cargo fmt/rtk cargo fmt/')")"
-
-# --- File operations ---
-elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')")"
-elif echo "$MATCH_CMD" | grep -qE '^(rg|grep)[[:space:]]+'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(rg|grep) /rtk grep /')")"
-elif echo "$MATCH_CMD" | grep -qE '^ls([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^ls/rtk ls/')")"
-elif echo "$MATCH_CMD" | grep -qE '^diff[[:space:]]+'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^diff /rtk diff /')")"
-elif echo "$MATCH_CMD" | grep -qE '^head[[:space:]]+'; then
-  # Transform: head -N file → rtk read file --max-lines N
-  # Also handle: head --lines=N file
-  if echo "$MATCH_CMD" | grep -qE '^head[[:space:]]+-[0-9]+[[:space:]]+'; then
-    LINES=$(echo "$MATCH_CMD" | sed -E 's/^head +-([0-9]+) +.+$/\1/')
-    FILE=$(echo "$MATCH_CMD" | sed -E 's/^head +-[0-9]+ +(.+)$/\1/')
-    REWRITTEN="$(rewrite_with_context "rtk read $FILE --max-lines $LINES")"
-  elif echo "$MATCH_CMD" | grep -qE '^head[[:space:]]+--lines=[0-9]+[[:space:]]+'; then
-    LINES=$(echo "$MATCH_CMD" | sed -E 's/^head +--lines=([0-9]+) +.+$/\1/')
-    FILE=$(echo "$MATCH_CMD" | sed -E 's/^head +--lines=[0-9]+ +(.+)$/\1/')
-    REWRITTEN="$(rewrite_with_context "rtk read $FILE --max-lines $LINES")"
+  if is_rtk_command "$cmd_trimmed"; then
+    printf ""
+    return
   fi
 
-# --- JS/TS tooling (added: npm run, npm test, vue-tsc) ---
-elif echo "$MATCH_CMD" | grep -qE '^(pnpm[[:space:]]+)?(npx[[:space:]]+)?vitest([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(pnpm )?(npx )?vitest( run)?/rtk vitest run/')")"
-elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+test([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm test/rtk vitest run/')")"
-elif echo "$MATCH_CMD" | grep -qE '^npm[[:space:]]+test([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^npm test/rtk npm test/')")"
-elif echo "$MATCH_CMD" | grep -qE '^npm[[:space:]]+run[[:space:]]+'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^npm run /rtk npm /')")"
-elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?vue-tsc([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?vue-tsc/rtk tsc/')")"
-elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+tsc([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm tsc/rtk tsc/')")"
-elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?tsc([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?tsc/rtk tsc/')")"
-elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+lint([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm lint/rtk lint/')")"
-elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?eslint([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?eslint/rtk lint/')")"
-elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?prettier([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?prettier/rtk prettier/')")"
-elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?playwright([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?playwright/rtk playwright/')")"
-elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+playwright([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm playwright/rtk playwright/')")"
-elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?prisma([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^(npx )?prisma/rtk prisma/')")"
+  local first second third
+  read -r first second third _ <<< "$cmd_trimmed"
 
-# --- Containers (added: docker compose, docker run/build/exec, kubectl describe/apply) ---
-elif echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]+compose([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^docker /rtk docker /')")"
-elif echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]+(ps|images|logs|run|build|exec)([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^docker /rtk docker /')")"
-elif echo "$MATCH_CMD" | grep -qE '^kubectl[[:space:]]+(get|logs|describe|apply)([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^kubectl /rtk kubectl /')")"
+  case "$first" in
+    git)
+      case "$second" in
+        status|diff|log|add|commit|push|pull|branch|fetch|stash|show|worktree)
+          printf "%s %s" "$RTK_CMD" "$cmd_trimmed"
+          return
+          ;;
+      esac
+      ;;
+    gh)
+      case "$second" in
+        pr|issue|run|api|release)
+          printf "%s %s" "$RTK_CMD" "$cmd_trimmed"
+          return
+          ;;
+      esac
+      ;;
+    cargo)
+      case "$second" in
+        test|build|clippy|check|install|fmt)
+          printf "%s %s" "$RTK_CMD" "$cmd_trimmed"
+          return
+          ;;
+      esac
+      ;;
+    docker)
+      case "$second" in
+        compose|ps|images|logs|run|build|exec)
+          printf "%s %s" "$RTK_CMD" "$cmd_trimmed"
+          return
+          ;;
+      esac
+      ;;
+    kubectl)
+      case "$second" in
+        get|logs|describe|apply)
+          printf "%s %s" "$RTK_CMD" "$cmd_trimmed"
+          return
+          ;;
+      esac
+      ;;
+    gcloud|bq|sqlite3|gsutil)
+      printf "%s proxy %s" "$RTK_CMD" "$cmd_trimmed"
+      return
+      ;;
+    curl|wget)
+      printf "%s %s" "$RTK_CMD" "$cmd_trimmed"
+      return
+      ;;
+    cat)
+      if [[ "$cmd_trimmed" == cat\ * ]]; then
+        printf "%s read %s" "$RTK_CMD" "${cmd_trimmed#cat }"
+        return
+      fi
+      ;;
+    rg|grep)
+      if [[ "$cmd_trimmed" == "$first "* ]]; then
+        printf "%s grep %s" "$RTK_CMD" "${cmd_trimmed#"$first "}"
+        return
+      fi
+      ;;
+    ls)
+      printf "%s ls%s" "$RTK_CMD" "${cmd_trimmed#ls}"
+      return
+      ;;
+    tree)
+      printf "%s ls%s" "$RTK_CMD" "${cmd_trimmed#tree}"
+      return
+      ;;
+    find)
+      printf "%s find%s" "$RTK_CMD" "${cmd_trimmed#find}"
+      return
+      ;;
+    diff)
+      if [[ "$cmd_trimmed" == diff\ * ]]; then
+        printf "%s diff %s" "$RTK_CMD" "${cmd_trimmed#diff }"
+        return
+      fi
+      ;;
+    head)
+      if [[ "$cmd_trimmed" =~ ^head[[:space:]]+-([0-9]+)[[:space:]]+(.+)$ ]]; then
+        printf "%s read %s --max-lines %s" "$RTK_CMD" "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
+        return
+      fi
+      if [[ "$cmd_trimmed" =~ ^head[[:space:]]+--lines=([0-9]+)[[:space:]]+(.+)$ ]]; then
+        printf "%s read %s --max-lines %s" "$RTK_CMD" "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
+        return
+      fi
+      ;;
+    npm)
+      if [[ "$cmd_trimmed" == "npm test" ]]; then
+        printf "%s npm test" "$RTK_CMD"
+        return
+      fi
+      if [[ "$cmd_trimmed" == npm\ test\ * ]]; then
+        printf "%s npm test%s" "$RTK_CMD" "${cmd_trimmed#npm test}"
+        return
+      fi
+      if [[ "$cmd_trimmed" == npm\ run\ * ]]; then
+        printf "%s npm %s" "$RTK_CMD" "${cmd_trimmed#npm run }"
+        return
+      fi
+      ;;
+    pnpm)
+      if [[ "$second" == "test" ]]; then
+        printf "%s vitest run%s" "$RTK_CMD" "${cmd_trimmed#pnpm test}"
+        return
+      fi
+      if [[ "$second" == "tsc" ]]; then
+        printf "%s tsc%s" "$RTK_CMD" "${cmd_trimmed#pnpm tsc}"
+        return
+      fi
+      if [[ "$second" == "lint" ]]; then
+        printf "%s lint%s" "$RTK_CMD" "${cmd_trimmed#pnpm lint}"
+        return
+      fi
+      if [[ "$second" == "playwright" ]]; then
+        printf "%s playwright%s" "$RTK_CMD" "${cmd_trimmed#pnpm playwright}"
+        return
+      fi
+      if [[ "$second" == "vitest" ]]; then
+        local tail="${cmd_trimmed#pnpm vitest}"
+        tail="$(trim_leading "$tail")"
+        if [[ "$tail" == run* ]]; then
+          tail="$(trim_leading "${tail#run}")"
+        fi
+        if [ -n "$tail" ]; then
+          printf "%s vitest run %s" "$RTK_CMD" "$tail"
+        else
+          printf "%s vitest run" "$RTK_CMD"
+        fi
+        return
+      fi
+      if [[ "$second" == "list" || "$second" == "ls" || "$second" == "outdated" ]]; then
+        printf "%s %s" "$RTK_CMD" "$cmd_trimmed"
+        return
+      fi
+      ;;
+    python|python3)
+      if [[ "$second" == "-m" && "$third" == "pytest" ]]; then
+        printf "%s pytest%s" "$RTK_CMD" "${cmd_trimmed#"$first -m pytest"}"
+        return
+      fi
+      if [[ "$second" == "-m" && "$third" == "ruff" ]]; then
+        printf "%s ruff%s" "$RTK_CMD" "${cmd_trimmed#"$first -m ruff"}"
+        return
+      fi
+      printf "%s proxy %s" "$RTK_CMD" "$cmd_trimmed"
+      return
+      ;;
+    pytest)
+      printf "%s pytest%s" "$RTK_CMD" "${cmd_trimmed#pytest}"
+      return
+      ;;
+    ruff)
+      case "$second" in
+        check|format)
+          printf "%s ruff%s" "$RTK_CMD" "${cmd_trimmed#ruff}"
+          return
+          ;;
+      esac
+      ;;
+    pip)
+      case "$second" in
+        list|outdated|install|show)
+          printf "%s pip%s" "$RTK_CMD" "${cmd_trimmed#pip}"
+          return
+          ;;
+      esac
+      ;;
+    uv)
+      if [[ "$second" == "pip" ]]; then
+        local uv_sub
+        uv_sub="$(trim_leading "${cmd_trimmed#uv pip}")"
+        case "${uv_sub%%[[:space:]]*}" in
+          list|outdated|install|show)
+            printf "%s pip %s" "$RTK_CMD" "$uv_sub"
+            return
+            ;;
+        esac
+      fi
+      ;;
+    go)
+      case "$second" in
+        test|build|vet)
+          printf "%s %s" "$RTK_CMD" "$cmd_trimmed"
+          return
+          ;;
+      esac
+      ;;
+    golangci-lint)
+      printf "%s golangci-lint%s" "$RTK_CMD" "${cmd_trimmed#golangci-lint}"
+      return
+      ;;
+    vitest)
+      local vitest_tail="${cmd_trimmed#vitest}"
+      vitest_tail="$(trim_leading "$vitest_tail")"
+      if [[ "$vitest_tail" == run* ]]; then
+        vitest_tail="$(trim_leading "${vitest_tail#run}")"
+      fi
+      if [ -n "$vitest_tail" ]; then
+        printf "%s vitest run %s" "$RTK_CMD" "$vitest_tail"
+      else
+        printf "%s vitest run" "$RTK_CMD"
+      fi
+      return
+      ;;
+    npx)
+      if [[ "$second" == "vitest" ]]; then
+        local npx_tail="${cmd_trimmed#npx vitest}"
+        npx_tail="$(trim_leading "$npx_tail")"
+        if [[ "$npx_tail" == run* ]]; then
+          npx_tail="$(trim_leading "${npx_tail#run}")"
+        fi
+        if [ -n "$npx_tail" ]; then
+          printf "%s vitest run %s" "$RTK_CMD" "$npx_tail"
+        else
+          printf "%s vitest run" "$RTK_CMD"
+        fi
+        return
+      fi
+      if [[ "$second" == "vue-tsc" ]]; then
+        printf "%s tsc%s" "$RTK_CMD" "${cmd_trimmed#npx vue-tsc}"
+        return
+      fi
+      if [[ "$second" == "tsc" ]]; then
+        printf "%s tsc%s" "$RTK_CMD" "${cmd_trimmed#npx tsc}"
+        return
+      fi
+      if [[ "$second" == "eslint" ]]; then
+        printf "%s lint%s" "$RTK_CMD" "${cmd_trimmed#npx eslint}"
+        return
+      fi
+      if [[ "$second" == "prettier" ]]; then
+        printf "%s prettier%s" "$RTK_CMD" "${cmd_trimmed#npx prettier}"
+        return
+      fi
+      if [[ "$second" == "playwright" ]]; then
+        printf "%s playwright%s" "$RTK_CMD" "${cmd_trimmed#npx playwright}"
+        return
+      fi
+      if [[ "$second" == "prisma" ]]; then
+        printf "%s prisma%s" "$RTK_CMD" "${cmd_trimmed#npx prisma}"
+        return
+      fi
+      ;;
+    tsc)
+      printf "%s tsc%s" "$RTK_CMD" "${cmd_trimmed#tsc}"
+      return
+      ;;
+    vue-tsc)
+      printf "%s tsc%s" "$RTK_CMD" "${cmd_trimmed#vue-tsc}"
+      return
+      ;;
+    eslint)
+      printf "%s lint%s" "$RTK_CMD" "${cmd_trimmed#eslint}"
+      return
+      ;;
+    prettier)
+      printf "%s prettier%s" "$RTK_CMD" "${cmd_trimmed#prettier}"
+      return
+      ;;
+    playwright)
+      printf "%s playwright%s" "$RTK_CMD" "${cmd_trimmed#playwright}"
+      return
+      ;;
+    prisma)
+      printf "%s prisma%s" "$RTK_CMD" "${cmd_trimmed#prisma}"
+      return
+      ;;
+  esac
 
-# --- Cloud/Data passthrough wrappers ---
-elif echo "$MATCH_CMD" | grep -qE '^gcloud([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^gcloud([[:space:]]|$)/rtk proxy gcloud\1/')")"
-elif echo "$MATCH_CMD" | grep -qE '^bq([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^bq([[:space:]]|$)/rtk proxy bq\1/')")"
-elif echo "$MATCH_CMD" | grep -qE '^sqlite3([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^sqlite3([[:space:]]|$)/rtk proxy sqlite3\1/')")"
+  printf ""
+}
 
-# --- Network ---
-elif echo "$MATCH_CMD" | grep -qE '^curl[[:space:]]+'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^curl /rtk curl /')")"
+rewrite_segment() {
+  local segment="$1"
 
-# --- pnpm package management ---
-elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+(list|ls|outdated)([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pnpm /rtk pnpm /')")"
+  # Skip heredoc-like commands entirely.
+  if [[ "$segment" == *'<<'* ]]; then
+    printf "%s" "$segment"
+    return
+  fi
 
-# --- Python tooling ---
-elif echo "$MATCH_CMD" | grep -qE '^pytest([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pytest/rtk pytest/')")"
-elif echo "$MATCH_CMD" | grep -qE '^python(3)?[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^python3? -m pytest/rtk pytest/')")"
-elif echo "$MATCH_CMD" | grep -qE '^ruff[[:space:]]+(check|format)([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^ruff /rtk ruff /')")"
-elif echo "$MATCH_CMD" | grep -qE '^python(3)?[[:space:]]+-m[[:space:]]+ruff([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^python3? -m ruff/rtk ruff/')")"
-elif echo "$MATCH_CMD" | grep -qE '^python(3)?([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed -E 's/^python3?/rtk proxy python/')")"
-elif echo "$MATCH_CMD" | grep -qE '^pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^pip /rtk pip /')")"
-elif echo "$MATCH_CMD" | grep -qE '^uv[[:space:]]+pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^uv pip /rtk pip /')")"
+  local leading_ws core trailing_ws
+  leading_ws="${segment%%[![:space:]]*}"
+  core="${segment#$leading_ws}"
+  trailing_ws="${core##*[![:space:]]}"
+  core="${core%"$trailing_ws"}"
 
-# --- Go tooling ---
-elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+test([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^go test/rtk go test/')")"
-elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+build([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^go build/rtk go build/')")"
-elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+vet([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^go vet/rtk go vet/')")"
-elif echo "$MATCH_CMD" | grep -qE '^golangci-lint([[:space:]]|$)'; then
-  REWRITTEN="$(rewrite_with_context "$(echo "$CMD_BODY" | sed 's/^golangci-lint/rtk golangci-lint/')")"
-fi
+  if [ -z "$core" ]; then
+    printf "%s" "$segment"
+    return
+  fi
+
+  strip_prefixes_for_match "$core"
+
+  if is_rtk_command "$MATCH_CMD"; then
+    printf "%s" "$segment"
+    return
+  fi
+
+  local rewritten_inner
+  rewritten_inner="$(rewrite_inner "$MATCH_CMD")"
+  if [ -z "$rewritten_inner" ]; then
+    printf "%s" "$segment"
+    return
+  fi
+
+  printf "%s%s%s%s%s" "$leading_ws" "$ENV_PREFIX" "$PREFIX_CHAIN" "$rewritten_inner" "$trailing_ws"
+}
+
+CHAIN_SEGMENTS=()
+CHAIN_SEPARATORS=()
+
+split_chain_with_separators() {
+  local input="$1"
+  CHAIN_SEGMENTS=()
+  CHAIN_SEPARATORS=()
+
+  if [[ "$input" == *'<<'* ]]; then
+    CHAIN_SEGMENTS=("$input")
+    return 0
+  fi
+
+  local len=${#input}
+  local i=0
+  local start=0
+  local in_single=0
+  local in_double=0
+  local escaped=0
+
+  while [ $i -lt $len ]; do
+    local ch="${input:i:1}"
+    local two="${input:i:2}"
+
+    if [ $escaped -eq 1 ]; then
+      escaped=0
+      i=$((i + 1))
+      continue
+    fi
+
+    if [[ "$ch" == "\\" && $in_single -eq 0 ]]; then
+      escaped=1
+      i=$((i + 1))
+      continue
+    fi
+
+    if [[ "$ch" == "'" && $in_double -eq 0 ]]; then
+      in_single=$((1 - in_single))
+      i=$((i + 1))
+      continue
+    fi
+
+    if [[ "$ch" == '"' && $in_single -eq 0 ]]; then
+      in_double=$((1 - in_double))
+      i=$((i + 1))
+      continue
+    fi
+
+    if [ $in_single -eq 0 ] && [ $in_double -eq 0 ]; then
+      if [[ "$two" == "&&" || "$two" == "||" ]]; then
+        CHAIN_SEGMENTS+=("${input:start:i-start}")
+        CHAIN_SEPARATORS+=("$two")
+        i=$((i + 2))
+        start=$i
+        continue
+      fi
+
+      if [[ "$ch" == ";" || "$ch" == $'\n' ]]; then
+        CHAIN_SEGMENTS+=("${input:start:i-start}")
+        CHAIN_SEPARATORS+=("$ch")
+        i=$((i + 1))
+        start=$i
+        continue
+      fi
+    fi
+
+    i=$((i + 1))
+  done
+
+  CHAIN_SEGMENTS+=("${input:start}")
+
+  # Ambiguous quoting: fail open.
+  if [ $in_single -eq 1 ] || [ $in_double -eq 1 ]; then
+    return 1
+  fi
+
+  return 0
+}
+
+rewrite_command_line() {
+  local input="$1"
+
+  if ! split_chain_with_separators "$input"; then
+    # Ambiguous parsing: fail open.
+    printf ""
+    return
+  fi
+
+  local changed=0
+  local i
+
+  if [ "$HOOK_MODE" = "strict" ]; then
+    if [ "${#CHAIN_SEGMENTS[@]}" -gt 0 ]; then
+      local original="${CHAIN_SEGMENTS[0]}"
+      local updated
+      updated="$(rewrite_segment "$original")"
+      if [ "$updated" != "$original" ]; then
+        CHAIN_SEGMENTS[0]="$updated"
+        changed=1
+      fi
+    fi
+  else
+    for ((i=0; i<${#CHAIN_SEGMENTS[@]}; i++)); do
+      local original="${CHAIN_SEGMENTS[$i]}"
+      local updated
+      updated="$(rewrite_segment "$original")"
+      if [ "$updated" != "$original" ]; then
+        CHAIN_SEGMENTS[$i]="$updated"
+        changed=1
+      fi
+    done
+  fi
+
+  if [ $changed -eq 0 ]; then
+    printf ""
+    return
+  fi
+
+  local rebuilt=""
+  for ((i=0; i<${#CHAIN_SEGMENTS[@]}; i++)); do
+    rebuilt+="${CHAIN_SEGMENTS[$i]}"
+    if [ $i -lt ${#CHAIN_SEPARATORS[@]} ]; then
+      rebuilt+="${CHAIN_SEPARATORS[$i]}"
+    fi
+  done
+
+  printf "%s" "$rebuilt"
+}
+
+REWRITTEN="$(rewrite_command_line "$CMD")"
 
 # If no rewrite needed, approve as-is
 if [ -z "$REWRITTEN" ]; then

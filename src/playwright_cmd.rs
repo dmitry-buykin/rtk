@@ -51,10 +51,12 @@ struct PlaywrightTest {
 #[derive(Debug, Deserialize)]
 struct PlaywrightTestResult {
     #[serde(rename = "status")]
+    #[allow(dead_code)]
     status: String,
     #[serde(rename = "error")]
     error: Option<PlaywrightError>,
     #[serde(rename = "duration", default)]
+    #[allow(dead_code)]
     duration: u64,
 }
 

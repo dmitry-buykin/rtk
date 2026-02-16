@@ -73,6 +73,7 @@ const PATTERNS: &[&str] = &[
     r"^kubectl\s+(get|logs|describe|apply)(\s|$)",
     r"^gcloud(\s|$)",
     r"^bq(\s|$)",
+    r"^gsutil(\s|$)",
     r"^sqlite3(\s|$)",
     r"^curl\s+",
     r"^wget\s+",
@@ -236,6 +237,13 @@ const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
+        rtk_cmd: "rtk proxy gsutil",
+        category: "Cloud",
+        savings_pct: 0.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
         rtk_cmd: "rtk proxy sqlite3",
         category: "Data",
         savings_pct: 0.0,
@@ -358,6 +366,7 @@ lazy_static! {
         r"^(?:(?:uv|poetry|pipenv|hatch|rye)\s+run\s+|(?:npm|pnpm)\s+exec(?:\s+--)?\s+)"
     )
     .unwrap();
+    static ref WRAPPER_PREFIX: Regex = Regex::new(r"^(?:(?:command|builtin)\s+)+").unwrap();
     static ref BARE_ENV_TOKEN: Regex = Regex::new(r"^[A-Z_][A-Z0-9_]*$").unwrap();
 }
 
@@ -411,6 +420,26 @@ fn normalize_command_for_classification(cmd: &str) -> Option<String> {
         }
     }
 
+    // Unwrap Claude tool wrappers like "Bash(command ls -la /path)".
+    if let Some(idx) = normalized.find("Bash(") {
+        if normalized.ends_with(')') && idx + 5 < normalized.len() {
+            normalized = normalized[idx + 5..normalized.len() - 1].trim();
+        }
+    }
+
+    // Strip no-op wrappers often emitted by command runners.
+    loop {
+        if let Some(rest) = normalized.strip_prefix("command ") {
+            normalized = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = normalized.strip_prefix("builtin ") {
+            normalized = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+
     // Allow escaped command names like "\ cp file".
     if let Some(rest) = normalized.strip_prefix('\\') {
         normalized = rest.trim_start();
@@ -443,11 +472,26 @@ pub fn classify_command(cmd: &str) -> Classification {
         return Classification::Ignored;
     }
 
-    // Strip env prefixes (sudo, env VAR=val, VAR=val)
-    let stripped_env = ENV_PREFIX.replace(&normalized, "");
-    // Strip runner wrappers so wrapped commands classify the same way.
-    let stripped_runner = RUNNER_PREFIX.replace(stripped_env.trim(), "");
-    let cmd_clean = stripped_runner.trim();
+    // Strip env + wrappers + runners so compacted commands classify the same way.
+    let mut cmd_clean_owned = normalized.clone();
+    for _ in 0..6 {
+        let stripped_env = ENV_PREFIX.replace(cmd_clean_owned.trim(), "").to_string();
+        let stripped_wrapper = WRAPPER_PREFIX.replace(stripped_env.trim(), "").to_string();
+        let stripped_runner = RUNNER_PREFIX.replace(stripped_wrapper.trim(), "").to_string();
+        let stripped_wrapper_again = WRAPPER_PREFIX
+            .replace(stripped_runner.trim(), "")
+            .to_string();
+        let next = stripped_wrapper_again.trim().to_string();
+        if next == cmd_clean_owned.trim() {
+            cmd_clean_owned = next;
+            break;
+        }
+        cmd_clean_owned = next;
+        if cmd_clean_owned.is_empty() {
+            break;
+        }
+    }
+    let cmd_clean = cmd_clean_owned.trim();
     if cmd_clean.is_empty() {
         return Classification::Ignored;
     }
@@ -488,7 +532,12 @@ pub fn classify_command(cmd: &str) -> Classification {
 
                 (savings, status)
             } else {
-                (rule.savings_pct, super::report::RtkStatus::Existing)
+                let status = if rule.rtk_cmd.starts_with("rtk proxy ") {
+                    super::report::RtkStatus::Passthrough
+                } else {
+                    super::report::RtkStatus::Existing
+                };
+                (rule.savings_pct, status)
             }
         } else {
             let status = if rule.rtk_cmd.starts_with("rtk proxy ") {
@@ -568,11 +617,23 @@ pub fn split_command_chain(cmd: &str) -> Vec<&str> {
     let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_backtick = false;
+    let mut escaped = false;
     let mut pipe_seen = false;
 
     while i < len {
         let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+
         match b {
+            b'\\' if !in_single => {
+                escaped = true;
+                i += 1;
+            }
             b'\'' if !in_double => {
                 in_single = !in_single;
                 i += 1;
@@ -581,7 +642,11 @@ pub fn split_command_chain(cmd: &str) -> Vec<&str> {
                 in_double = !in_double;
                 i += 1;
             }
-            b'|' if !in_single && !in_double => {
+            b'`' if !in_single && !in_double => {
+                in_backtick = !in_backtick;
+                i += 1;
+            }
+            b'|' if !in_single && !in_double && !in_backtick => {
                 if i + 1 < len && bytes[i + 1] == b'|' {
                     // ||
                     let segment = trimmed[start..i].trim();
@@ -600,7 +665,13 @@ pub fn split_command_chain(cmd: &str) -> Vec<&str> {
                     break;
                 }
             }
-            b'&' if !in_single && !in_double && i + 1 < len && bytes[i + 1] == b'&' => {
+            b'&'
+                if !in_single
+                    && !in_double
+                    && !in_backtick
+                    && i + 1 < len
+                    && bytes[i + 1] == b'&' =>
+            {
                 let segment = trimmed[start..i].trim();
                 if !segment.is_empty() {
                     results.push(segment);
@@ -608,7 +679,7 @@ pub fn split_command_chain(cmd: &str) -> Vec<&str> {
                 i += 2;
                 start = i;
             }
-            b';' if !in_single && !in_double => {
+            b';' if !in_single && !in_double && !in_backtick => {
                 let segment = trimmed[start..i].trim();
                 if !segment.is_empty() {
                     results.push(segment);
@@ -616,7 +687,7 @@ pub fn split_command_chain(cmd: &str) -> Vec<&str> {
                 i += 1;
                 start = i;
             }
-            b'\n' | b'\r' if !in_single && !in_double => {
+            b'\n' | b'\r' if !in_single && !in_double && !in_backtick => {
                 // Respect line continuation with trailing backslash.
                 if i > 0 && bytes[i - 1] == b'\\' {
                     i += 1;
@@ -947,6 +1018,45 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_command_wrapper() {
+        assert_eq!(
+            classify_command("command ls -la /tmp"),
+            Classification::Supported {
+                rtk_equivalent: "rtk ls",
+                category: "Files",
+                estimated_savings_pct: 65.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_bash_wrapper_line() {
+        assert_eq!(
+            classify_command("Bash(command ls -la /Users/test/project)"),
+            Classification::Supported {
+                rtk_equivalent: "rtk ls",
+                category: "Files",
+                estimated_savings_pct: 65.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_gsutil_supported_passthrough() {
+        assert_eq!(
+            classify_command("gsutil ls gs://demo-bucket"),
+            Classification::Supported {
+                rtk_equivalent: "rtk proxy gsutil",
+                category: "Cloud",
+                estimated_savings_pct: 0.0,
+                status: RtkStatus::Passthrough,
+            }
+        );
+    }
+
+    #[test]
     fn test_classify_noise_comment_ignored() {
         assert_eq!(classify_command("# Check credentials"), Classification::Ignored);
     }
@@ -1046,5 +1156,10 @@ mod tests {
             split_command_chain("echo hello \\\nworld"),
             vec!["echo hello \\\nworld"]
         );
+    }
+
+    #[test]
+    fn test_split_escaped_semicolon_not_split() {
+        assert_eq!(split_command_chain(r#"echo foo\;bar"#), vec![r#"echo foo\;bar"#]);
     }
 }

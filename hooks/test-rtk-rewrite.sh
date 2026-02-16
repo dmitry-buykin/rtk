@@ -5,12 +5,12 @@
 # Usage: bash ~/.claude/hooks/test-rtk-rewrite.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOK="${HOOK:-$HOME/.claude/hooks/rtk-rewrite.sh}"
+HOOK="${HOOK:-$SCRIPT_DIR/rtk-rewrite.sh}"
 if [ ! -f "$HOOK" ]; then
   HOOK="$SCRIPT_DIR/../.claude/hooks/rtk-rewrite.sh"
 fi
 if [ ! -f "$HOOK" ]; then
-  HOOK="$SCRIPT_DIR/rtk-rewrite.sh"
+  HOOK="$HOME/.claude/hooks/rtk-rewrite.sh"
 fi
 RTK_BIN="$(command -v rtk 2>/dev/null || echo rtk)"
 PASS=0
@@ -34,6 +34,16 @@ test_rewrite() {
   local output
   output=$(echo "$input_json" | RTK_BIN="$RTK_BIN" bash "$HOOK" 2>/dev/null) || true
 
+  normalize_cmd() {
+    local value="$1"
+    local needle="${RTK_BIN} "
+    value="${value//$needle/rtk }"
+    if [[ "$value" == "$RTK_BIN" ]]; then
+      value="rtk"
+    fi
+    printf "%s" "$value"
+  }
+
   if [ -z "$expected_cmd" ]; then
     # Expect no rewrite (hook exits 0 with no output)
     if [ -z "$output" ]; then
@@ -50,6 +60,8 @@ test_rewrite() {
   else
     local actual
     actual=$(echo "$output" | jq -r '.hookSpecificOutput.updatedInput.command // empty' 2>/dev/null)
+    actual="$(normalize_cmd "$actual")"
+    expected_cmd="$(normalize_cmd "$expected_cmd")"
     if [ "$actual" = "$expected_cmd" ]; then
       printf "  ${GREEN}PASS${RESET} %s ${DIM}→ %s${RESET}\n" "$description" "$actual"
       PASS=$((PASS + 1))
@@ -213,17 +225,17 @@ test_rewrite "docker exec -it db psql" \
   "docker exec -it db psql" \
   "rtk docker exec -it db psql"
 
-test_rewrite "find (NOT rewritten — different arg format)" \
+test_rewrite "find" \
   "find . -name '*.ts'" \
-  ""
+  "rtk find . -name '*.ts'"
 
-test_rewrite "tree (NOT rewritten — different arg format)" \
+test_rewrite "tree" \
   "tree src/" \
-  ""
+  "rtk ls src/"
 
-test_rewrite "wget (NOT rewritten — different arg format)" \
+test_rewrite "wget" \
   "wget https://example.com/file" \
-  ""
+  "rtk wget https://example.com/file"
 
 test_rewrite "gh api repos/owner/repo" \
   "gh api repos/owner/repo" \
@@ -293,7 +305,7 @@ test_rewrite "mkdir (no pattern)" \
 
 test_rewrite "python3 (no pattern)" \
   "python3 script.py" \
-  ""
+  "rtk proxy python3 script.py"
 
 test_rewrite "node (no pattern)" \
   "node -e 'console.log(1)'" \

@@ -9,6 +9,7 @@
 
 pub mod error;
 pub mod formatter;
+#[allow(dead_code)]
 pub mod types;
 
 pub use formatter::{FormatMode, TokenFormatter};
@@ -27,6 +28,7 @@ pub enum ParseResult<T> {
     Passthrough(String),
 }
 
+#[allow(dead_code)]
 impl<T> ParseResult<T> {
     /// Unwrap the parsed data, panicking on Passthrough
     pub fn unwrap(self) -> T {
@@ -85,6 +87,7 @@ pub trait OutputParser: Sized {
     fn parse(input: &str) -> ParseResult<Self::Output>;
 
     /// Parse with explicit tier preference (for testing/debugging)
+    #[allow(dead_code)]
     fn parse_with_tier(input: &str, max_tier: u8) -> ParseResult<Self::Output> {
         let result = Self::parse(input);
         if result.tier() > max_tier {

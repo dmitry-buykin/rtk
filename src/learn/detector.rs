@@ -2,6 +2,7 @@ use lazy_static::lazy_static;
 use regex::Regex;
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum ErrorType {
     UnknownFlag,
     CommandNotFound,

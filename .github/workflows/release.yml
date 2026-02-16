@@ -190,6 +190,7 @@ jobs:
 
   homebrew:
     name: Update Homebrew formula
+    if: github.repository == 'rtk-ai/rtk'
     needs: [release]
     runs-on: ubuntu-latest
     steps:

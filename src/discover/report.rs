@@ -7,8 +7,6 @@ pub enum RtkStatus {
     Existing,
     /// Works via external_subcommand passthrough, no filtering (e.g., cargo fmt → Other)
     Passthrough,
-    /// RTK doesn't handle this command at all
-    NotSupported,
 }
 
 impl RtkStatus {
@@ -16,7 +14,6 @@ impl RtkStatus {
         match self {
             RtkStatus::Existing => "existing",
             RtkStatus::Passthrough => "passthrough",
-            RtkStatus::NotSupported => "not-supported",
         }
     }
 }

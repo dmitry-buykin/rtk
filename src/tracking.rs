@@ -324,7 +324,7 @@ impl Tracker {
             ],
         )?;
 
-        drop(conn);
+        let _ = conn;
         self.cleanup_old()?;
         Ok(())
     }
@@ -1018,6 +1018,7 @@ pub fn args_display(args: &[OsString]) -> String {
 /// timer.track("ls -la", "rtk ls", "input", "output");
 /// ```
 #[deprecated(note = "Use TimedExecution instead")]
+#[allow(dead_code)]
 pub fn track(original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
     let input_tokens = estimate_tokens(input);
     let output_tokens = estimate_tokens(output);
@@ -1043,8 +1044,15 @@ pub(crate) fn sanitize_command_for_tracking(command: &str) -> String {
             continue;
         }
 
-        if let Some(redacted) = mask_url_credentials(token) {
-            result.push(redacted);
+        let mut masked_token = token.to_string();
+        if let Some(redacted) = mask_url_credentials(&masked_token) {
+            masked_token = redacted;
+        }
+        if let Some(redacted) = mask_sensitive_url_query(&masked_token) {
+            masked_token = redacted;
+        }
+        if masked_token != token {
+            result.push(masked_token);
             continue;
         }
 
@@ -1104,7 +1112,7 @@ fn is_sensitive_key(token: &str) -> bool {
         return false;
     }
 
-    const SENSITIVE_PARTS: [&str; 25] = [
+    const SENSITIVE_PARTS: [&str; 29] = [
         "token",
         "secret",
         "password",
@@ -1127,6 +1135,10 @@ fn is_sensitive_key(token: &str) -> bool {
         "jwt",
         "cookie",
         "key",
+        "signature",
+        "sessionid",
+        "oauth",
+        "refresh",
         "pass",
         "passphrase",
         "bearer",
@@ -1185,6 +1197,62 @@ fn mask_url_credentials(token: &str) -> Option<String> {
     ))
 }
 
+fn mask_sensitive_url_query(token: &str) -> Option<String> {
+    let query_start = token.find('?')?;
+    let query_fragment = &token[query_start + 1..];
+    let (query, fragment) = if let Some(hash_idx) = query_fragment.find('#') {
+        (
+            &query_fragment[..hash_idx],
+            Some(&query_fragment[hash_idx + 1..]),
+        )
+    } else {
+        (query_fragment, None)
+    };
+
+    if query.is_empty() {
+        return None;
+    }
+
+    let mut changed = false;
+    let mut pairs = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            pairs.push(String::new());
+            continue;
+        }
+
+        if let Some((name, value)) = pair.split_once('=') {
+            if is_sensitive_key(name) {
+                pairs.push(format!("{name}={REDACTED_VALUE}"));
+                changed = true;
+            } else if value.is_empty() && is_sensitive_key(name.trim_end_matches(':')) {
+                pairs.push(format!("{name}={REDACTED_VALUE}"));
+                changed = true;
+            } else {
+                pairs.push(pair.to_string());
+            }
+        } else if is_sensitive_key(pair) {
+            pairs.push(format!("{pair}={REDACTED_VALUE}"));
+            changed = true;
+        } else {
+            pairs.push(pair.to_string());
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str(&token[..query_start + 1]);
+    out.push_str(&pairs.join("&"));
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    Some(out)
+}
+
 fn should_redact_next_for_colon_value(value: &str) -> bool {
     matches!(
         normalize_token_for_match(value).as_str(),
@@ -1195,6 +1263,12 @@ fn should_redact_next_for_colon_value(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]
@@ -1346,10 +1420,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_mask_url_query_sensitive_params() {
+        assert_eq!(
+            sanitize_command_for_tracking(
+                "curl https://api.example.com/data?foo=1&access_token=abc123&signature=deadbeef"
+            ),
+            format!(
+                "curl https://api.example.com/data?foo=1&access_token={}&signature={}",
+                REDACTED_VALUE, REDACTED_VALUE
+            )
+        );
+    }
+
     // 9. get_db_path respects environment variable RTK_DB_PATH
     #[test]
     fn test_custom_db_path_env() {
         use std::env;
+        let _guard = env_test_lock().lock().expect("env test mutex poisoned");
 
         let custom_path = dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -1366,6 +1454,7 @@ mod tests {
     #[test]
     fn test_custom_db_path_env_rejects_external_path() {
         use std::env;
+        let _guard = env_test_lock().lock().expect("env test mutex poisoned");
 
         env::set_var("RTK_DB_PATH", "/tmp/rtk_test_custom.db");
 
@@ -1384,6 +1473,7 @@ mod tests {
     #[test]
     fn test_default_db_path() {
         use std::env;
+        let _guard = env_test_lock().lock().expect("env test mutex poisoned");
 
         // Ensure no env var is set
         env::remove_var("RTK_DB_PATH");

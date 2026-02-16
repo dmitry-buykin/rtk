@@ -310,14 +310,57 @@ fn prompt_user_consent(settings_path: &Path) -> Result<bool> {
     Ok(response == "y" || response == "yes")
 }
 
+fn shell_escape_for_hook(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-:=+".contains(c))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn build_hook_command(hook_path: &Path) -> Result<String> {
+    let hook = hook_path
+        .to_str()
+        .context("Hook path contains invalid UTF-8")?;
+
+    let rtk_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rtk"));
+    let rtk_bin_str = rtk_bin.to_string_lossy().to_string();
+
+    let mut path_entries = Vec::<String>::new();
+    if let Some(parent) = rtk_bin.parent() {
+        path_entries.push(parent.to_string_lossy().to_string());
+    }
+    for default in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        if !path_entries.iter().any(|p| p == default) {
+            path_entries.push(default.to_string());
+        }
+    }
+
+    let path_value = path_entries.join(":");
+
+    Ok(format!(
+        "RTK_BIN={} PATH={} {}",
+        shell_escape_for_hook(&rtk_bin_str),
+        shell_escape_for_hook(&path_value),
+        shell_escape_for_hook(hook)
+    ))
+}
+
 /// Print manual instructions for settings.json patching
-fn print_manual_instructions(hook_path: &Path) {
+fn print_manual_instructions(hook_command: &str) {
     println!("\n  MANUAL STEP: Add this to ~/.claude/settings.json:");
     println!("  {{");
     println!("    \"hooks\": {{ \"PreToolUse\": [{{");
     println!("      \"matcher\": \"Bash\",");
     println!("      \"hooks\": [{{ \"type\": \"command\",");
-    println!("        \"command\": \"{}\"", hook_path.display());
+    println!("        \"command\": \"{}\"", hook_command);
     println!("      }}]");
     println!("    }}]}}");
     println!("  }}");
@@ -471,9 +514,7 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
 fn patch_settings_json(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result<PatchResult> {
     let claude_dir = resolve_claude_dir()?;
     let settings_path = claude_dir.join("settings.json");
-    let hook_command = hook_path
-        .to_str()
-        .context("Hook path contains invalid UTF-8")?;
+    let hook_command = build_hook_command(hook_path)?;
 
     // Read or create settings.json
     let mut root = if settings_path.exists() {
@@ -501,12 +542,12 @@ fn patch_settings_json(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result
     // Handle mode
     match mode {
         PatchMode::Skip => {
-            print_manual_instructions(hook_path);
+            print_manual_instructions(&hook_command);
             return Ok(PatchResult::Skipped);
         }
         PatchMode::Ask => {
             if !prompt_user_consent(&settings_path)? {
-                print_manual_instructions(hook_path);
+                print_manual_instructions(&hook_command);
                 return Ok(PatchResult::Declined);
             }
         }
@@ -558,7 +599,6 @@ fn clean_double_blanks(content: &str) -> String {
         if line.trim().is_empty() {
             // Count consecutive blank lines
             let mut blank_count = 0;
-            let start = i;
             while i < lines.len() && lines[i].trim().is_empty() {
                 blank_count += 1;
                 i += 1;
@@ -1282,11 +1322,6 @@ More content"#;
         let original = r#"{"env": {"PATH": "/usr/bin"}, "permissions": {"allowAll": true}, "model": "claude-sonnet-4"}"#;
         let parsed: serde_json::Value = serde_json::from_str(original).unwrap();
         let serialized = serde_json::to_string(&parsed).unwrap();
-
-        // Keys should appear in same order
-        let original_keys: Vec<&str> = original.split("\"").filter(|s| s.contains(":")).collect();
-        let serialized_keys: Vec<&str> =
-            serialized.split("\"").filter(|s| s.contains(":")).collect();
 
         // Just check that keys exist (preserve_order doesn't guarantee exact order in nested objects)
         assert!(serialized.contains("\"env\""));
