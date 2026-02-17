@@ -22,7 +22,7 @@ rtk filters and compresses command outputs before they reach your LLM context, s
 
 **How to verify you have the correct rtk:**
 ```bash
-rtk --version   # Should show "rtk 0.18.1"
+rtk --version   # Should show "rtk 0.20.1"
 rtk gain        # Should show token savings stats
 ```
 
@@ -65,11 +65,22 @@ which rtk            # Check installation path
 
 If already installed and `rtk gain` works, **DO NOT reinstall**. Skip to Quick Start.
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install rtk
+```
+
 ### Quick Install (Linux/macOS)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
 ```
+
+> **Note**: rtk installs to `~/.local/bin` by default. If this directory is not in your PATH, add it:
+> ```bash
+> echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc  # or ~/.zshrc
+> ```
 
 After installation, **verify you have the correct rtk**:
 ```bash
