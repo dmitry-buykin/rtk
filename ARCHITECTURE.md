@@ -3,6 +3,7 @@
 > **rtk (Rust Token Killer)** - A high-performance CLI proxy that minimizes LLM token consumption through intelligent output filtering and compression.
 
 This document provides a comprehensive architectural overview of rtk, including system design, data flows, module organization, and implementation patterns.
+Current version: **0.21.1**
 
 ---
 

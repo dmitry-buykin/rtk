@@ -7,6 +7,7 @@ set -e
 REPO="rtk-ai/rtk"
 BINARY_NAME="rtk"
 INSTALL_DIR="${RTK_INSTALL_DIR:-$HOME/.local/bin}"
+SKIP_CHECKSUM="${RTK_SKIP_CHECKSUM:-0}"
 
 # Colors
 RED='\033[0;31m'
@@ -65,6 +66,23 @@ get_target() {
     esac
 }
 
+# Compute SHA-256 hash (supports Linux/macOS)
+sha256_file() {
+    file="$1"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+        return 0
+    fi
+
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+        return 0
+    fi
+
+    return 1
+}
+
 # Download and install
 install() {
     info "Detected: $OS $ARCH"
@@ -78,6 +96,34 @@ install() {
     info "Downloading from: $DOWNLOAD_URL"
     if ! curl -fsSL "$DOWNLOAD_URL" -o "$ARCHIVE"; then
         error "Failed to download binary"
+    fi
+
+    if [ "$SKIP_CHECKSUM" = "1" ]; then
+        warn "Skipping checksum verification (RTK_SKIP_CHECKSUM=1)"
+    else
+        CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt"
+        CHECKSUMS_FILE="${TEMP_DIR}/checksums.txt"
+        ARCHIVE_NAME="${BINARY_NAME}-${TARGET}.tar.gz"
+
+        info "Verifying checksum..."
+        if ! curl -fsSL "$CHECKSUMS_URL" -o "$CHECKSUMS_FILE"; then
+            error "Failed to download checksums.txt (set RTK_SKIP_CHECKSUM=1 to bypass)"
+        fi
+
+        EXPECTED_SHA=$(grep " ${ARCHIVE_NAME}$" "$CHECKSUMS_FILE" | head -n 1 | awk '{print $1}')
+        if [ -z "$EXPECTED_SHA" ]; then
+            error "No checksum entry for ${ARCHIVE_NAME} (set RTK_SKIP_CHECKSUM=1 to bypass)"
+        fi
+
+        ACTUAL_SHA=$(sha256_file "$ARCHIVE")
+        if [ -z "$ACTUAL_SHA" ]; then
+            error "No SHA-256 tool found (need sha256sum or shasum, or set RTK_SKIP_CHECKSUM=1)"
+        fi
+
+        if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+            error "Checksum mismatch for ${ARCHIVE_NAME}"
+        fi
+        info "Checksum verified"
     fi
 
     info "Extracting..."

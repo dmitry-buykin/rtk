@@ -8,6 +8,8 @@
 
 rtk filters and compresses command outputs before they reach your LLM context, saving 60-90% of tokens on common operations.
 
+Current version: **0.21.1**
+
 ## ⚠️ Important: Name Collision Warning
 
 **There are TWO different projects named "rtk":**
@@ -22,7 +24,7 @@ rtk filters and compresses command outputs before they reach your LLM context, s
 
 **How to verify you have the correct rtk:**
 ```bash
-rtk --version   # Should show "rtk 0.20.1"
+rtk --version   # Should show "rtk 0.21.1"
 rtk gain        # Should show token savings stats
 ```
 
