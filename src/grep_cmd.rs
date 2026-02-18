@@ -4,16 +4,29 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::process::Command;
 
-pub fn run(
-    pattern: &str,
-    path: &str,
-    max_line_len: usize,
-    max_results: usize,
-    context_only: bool,
-    file_type: Option<&str>,
-    extra_args: &[String],
-    verbose: u8,
-) -> Result<()> {
+pub struct GrepOptions<'a> {
+    pub pattern: &'a str,
+    pub path: &'a str,
+    pub max_line_len: usize,
+    pub max_results: usize,
+    pub context_only: bool,
+    pub file_type: Option<&'a str>,
+    pub extra_args: &'a [String],
+    pub verbose: u8,
+}
+
+pub fn run(opts: GrepOptions<'_>) -> Result<()> {
+    let GrepOptions {
+        pattern,
+        path,
+        max_line_len,
+        max_results,
+        context_only,
+        file_type,
+        extra_args,
+        verbose,
+    } = opts;
+
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {

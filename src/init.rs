@@ -530,7 +530,7 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
             fs::write(&claude_md_path, cleaned).with_context(|| {
                 format!("Failed to write CLAUDE.md: {}", claude_md_path.display())
             })?;
-            removed.push(format!("CLAUDE.md: removed @RTK.md reference"));
+            removed.push("CLAUDE.md: removed @RTK.md reference".to_string());
         }
     }
 
@@ -650,9 +650,7 @@ fn clean_double_blanks(content: &str) -> String {
 
             // Keep at most 2 blank lines
             let keep = blank_count.min(2);
-            for _ in 0..keep {
-                result.push("");
-            }
+            result.extend(std::iter::repeat_n("", keep));
         } else {
             result.push(line);
             i += 1;

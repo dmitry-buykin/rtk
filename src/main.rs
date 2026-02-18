@@ -1086,16 +1086,16 @@ fn main() -> Result<()> {
             file_type,
             extra_args,
         } => {
-            grep_cmd::run(
-                &pattern,
-                &path,
-                max_len,
-                max,
+            grep_cmd::run(grep_cmd::GrepOptions {
+                pattern: &pattern,
+                path: &path,
+                max_line_len: max_len,
+                max_results: max,
                 context_only,
-                file_type.as_deref(),
-                &extra_args,
-                cli.verbose,
-            )?;
+                file_type: file_type.as_deref(),
+                extra_args: &extra_args,
+                verbose: cli.verbose,
+            })?;
         }
 
         Commands::Init {
@@ -1146,18 +1146,18 @@ fn main() -> Result<()> {
             all,
             format,
         } => {
-            gain::run(
+            gain::run(gain::GainOptions {
                 graph,
                 history,
                 quota,
-                &tier,
+                tier: &tier,
                 daily,
                 weekly,
                 monthly,
                 all,
-                &format,
-                cli.verbose,
-            )?;
+                format: &format,
+                verbose: cli.verbose,
+            })?;
         }
 
         Commands::CcEconomics {

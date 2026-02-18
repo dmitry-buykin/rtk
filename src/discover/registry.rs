@@ -403,15 +403,10 @@ fn normalize_command_for_classification(cmd: &str) -> Option<String> {
 
     // Strip common shell prompt markers.
     loop {
-        let stripped = if let Some(rest) = normalized.strip_prefix("$ ") {
-            Some(rest)
-        } else if let Some(rest) = normalized.strip_prefix("% ") {
-            Some(rest)
-        } else if let Some(rest) = normalized.strip_prefix("> ") {
-            Some(rest)
-        } else {
-            None
-        };
+        let stripped = normalized
+            .strip_prefix("$ ")
+            .or_else(|| normalized.strip_prefix("% "))
+            .or_else(|| normalized.strip_prefix("> "));
 
         if let Some(rest) = stripped {
             normalized = rest.trim_start();

@@ -6,18 +6,33 @@ use colored::Colorize; // added: terminal colors
 use serde::Serialize;
 use std::io::IsTerminal; // added: TTY detection for graceful degradation
 
-pub fn run(
-    graph: bool,
-    history: bool,
-    quota: bool,
-    tier: &str,
-    daily: bool,
-    weekly: bool,
-    monthly: bool,
-    all: bool,
-    format: &str,
-    _verbose: u8,
-) -> Result<()> {
+pub struct GainOptions<'a> {
+    pub graph: bool,
+    pub history: bool,
+    pub quota: bool,
+    pub tier: &'a str,
+    pub daily: bool,
+    pub weekly: bool,
+    pub monthly: bool,
+    pub all: bool,
+    pub format: &'a str,
+    pub verbose: u8,
+}
+
+pub fn run(opts: GainOptions<'_>) -> Result<()> {
+    let GainOptions {
+        graph,
+        history,
+        quota,
+        tier,
+        daily,
+        weekly,
+        monthly,
+        all,
+        format,
+        verbose: _verbose,
+    } = opts;
+
     let tracker = Tracker::new().context("Failed to initialize tracking database")?;
 
     // Handle export formats

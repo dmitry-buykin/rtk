@@ -42,6 +42,7 @@ use std::time::Instant;
 const HISTORY_DAYS: i64 = 90;
 const TRACKING_DB_FILE: &str = "history.db";
 const REDACTED_VALUE: &str = "<redacted>";
+type CommandStats = (String, usize, usize, f64, u64);
 
 /// Main tracking interface for recording and querying command history.
 ///
@@ -108,7 +109,7 @@ pub struct GainSummary {
     /// Average execution time per command (milliseconds)
     pub avg_time_ms: u64,
     /// Top 10 commands by tokens saved: (cmd, count, saved, avg_pct, avg_time_ms)
-    pub by_command: Vec<(String, usize, usize, f64, u64)>,
+    pub by_command: Vec<CommandStats>,
     /// Last 30 days of activity: (date, saved_tokens)
     pub by_day: Vec<(String, usize)>,
 }
@@ -433,7 +434,7 @@ impl Tracker {
         })
     }
 
-    fn get_by_command(&self) -> Result<Vec<(String, usize, usize, f64, u64)>> {
+    fn get_by_command(&self) -> Result<Vec<CommandStats>> {
         let Some(conn) = self.conn.as_ref() else {
             return Ok(Vec::new());
         };
@@ -1099,11 +1100,11 @@ pub(crate) fn sanitize_command_for_tracking(command: &str) -> String {
 fn is_sensitive_flag(token: &str) -> bool {
     let key = token
         .trim_start_matches('-')
-        .split(|c| c == '=' || c == ':')
+        .split(['=', ':'])
         .next()
         .unwrap_or_default();
 
-    is_sensitive_key(&key)
+    is_sensitive_key(key)
 }
 
 fn is_sensitive_key(token: &str) -> bool {
@@ -1222,10 +1223,9 @@ fn mask_sensitive_url_query(token: &str) -> Option<String> {
         }
 
         if let Some((name, value)) = pair.split_once('=') {
-            if is_sensitive_key(name) {
-                pairs.push(format!("{name}={REDACTED_VALUE}"));
-                changed = true;
-            } else if value.is_empty() && is_sensitive_key(name.trim_end_matches(':')) {
+            if is_sensitive_key(name)
+                || (value.is_empty() && is_sensitive_key(name.trim_end_matches(':')))
+            {
                 pairs.push(format!("{name}={REDACTED_VALUE}"));
                 changed = true;
             } else {
