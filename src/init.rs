@@ -701,6 +701,13 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) {
 /// Check if RTK hook is already present in settings.json
 /// Matches on rtk-rewrite.sh substring to handle different path formats
 fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
+    let hook_script_present = |command: &str| {
+        command
+            .split_whitespace()
+            .map(unquote_shell_token)
+            .any(|token| token.ends_with("rtk-rewrite.sh"))
+    };
+
     let expected_hook_path = extract_hook_path_from_command(hook_command)
         .map(|path| normalize_hook_path(&path));
 
@@ -720,6 +727,12 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
         .filter_map(|hook| hook.get("command")?.as_str())
         .any(|cmd| {
             if cmd == hook_command {
+                return true;
+            }
+
+            // Accept different absolute/home-expanded paths as long as both
+            // commands invoke rtk-rewrite.sh (keeps init idempotent across machines)
+            if hook_script_present(cmd) && hook_script_present(hook_command) {
                 return true;
             }
 

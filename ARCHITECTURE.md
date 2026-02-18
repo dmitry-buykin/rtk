@@ -3,7 +3,7 @@
 > **rtk (Rust Token Killer)** - A high-performance CLI proxy that minimizes LLM token consumption through intelligent output filtering and compression.
 
 This document provides a comprehensive architectural overview of rtk, including system design, data flows, module organization, and implementation patterns.
-Current version: **0.21.1**
+Current version: **0.22.0**
 
 ---
 
@@ -241,7 +241,7 @@ SHARED            utils.rs          Helpers                N/A        ✓
                   tee.rs            Full output recovery   N/A        ✓
 ```
 
-**Total: 48 modules** (30 command modules + 18 infrastructure modules)
+**Total: 49 modules** (31 command modules + 18 infrastructure modules)
 
 ### Module Count Breakdown
 
