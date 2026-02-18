@@ -7,15 +7,21 @@ yanked = "warn"
 ignore = []
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
 deny = []
-skip = []
-skip-tree = []
+skip = [
+  { crate = "getrandom@0.2.17", reason = "target-specific legacy chain via dirs/redox_users" },
+  { crate = "hashbrown@0.14.5", reason = "pulled by rusqlite/hashlink until upstream unifies" },
+]
+skip-tree = [
+  { crate = "windows-sys@0.48.0", reason = "legacy windows target support path" },
+  { crate = "windows-sys@0.59.0", reason = "transitive windows support path from colored v2" },
+]
 
 [licenses]
 allow = [

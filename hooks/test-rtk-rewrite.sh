@@ -331,6 +331,14 @@ test_rewrite "git status with file redirect (no rewrite)" \
   "git status > /tmp/git-status.txt" \
   ""
 
+test_rewrite "command substitution should not rewrite" \
+  "echo $(git status)" \
+  ""
+
+test_rewrite "backticks should not rewrite" \
+  "echo \`git status\`" \
+  ""
+
 echo ""
 
 # ---- SECTION 6: Audit logging ----

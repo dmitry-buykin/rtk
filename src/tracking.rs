@@ -1057,17 +1057,20 @@ pub(crate) fn sanitize_command_for_tracking(command: &str) -> String {
             continue;
         }
 
-        if let Some((name, _value)) = token.split_once('=') {
-            if is_sensitive_key(name) {
+        if let Some((name, value)) = token.split_once('=') {
+            if is_sensitive_key(name) || value_contains_sensitive_marker(value) {
                 result.push(format!("{}={}", name, REDACTED_VALUE));
+                if should_redact_next_for_colon_value(value) {
+                    redact_next = true;
+                }
             } else {
-                result.push(format!("{name}={_value}"));
+                result.push(format!("{name}={value}"));
             }
             continue;
         }
 
         if let Some((name, value)) = token.split_once(':') {
-            if is_sensitive_key(name) {
+            if is_sensitive_key(name) || value_contains_sensitive_marker(value) {
                 result.push(format!("{}:{}", name, REDACTED_VALUE));
                 if token.ends_with(':') || should_redact_next_for_colon_value(value) {
                     redact_next = true;
@@ -1254,10 +1257,34 @@ fn mask_sensitive_url_query(token: &str) -> Option<String> {
 }
 
 fn should_redact_next_for_colon_value(value: &str) -> bool {
-    matches!(
-        normalize_token_for_match(value).as_str(),
-        "bearer" | "basic" | "token"
-    )
+    let normalized = normalize_token_for_match(value);
+    if matches!(normalized.as_str(), "bearer" | "basic" | "token") {
+        return true;
+    }
+
+    normalized
+        .rsplit([':', '='])
+        .next()
+        .is_some_and(|tail| matches!(tail, "bearer" | "basic" | "token"))
+}
+
+fn value_contains_sensitive_marker(value: &str) -> bool {
+    let normalized = normalize_token_for_match(value);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if is_sensitive_key(&normalized) {
+        return true;
+    }
+
+    if normalized.starts_with("bearer ") || normalized.starts_with("basic ") {
+        return true;
+    }
+
+    normalized
+        .split(['=', ':', ',', ';'])
+        .any(is_sensitive_key)
 }
 
 #[cfg(test)]
@@ -1430,6 +1457,18 @@ mod tests {
                 "curl https://api.example.com/data?foo=1&access_token={}&signature={}",
                 REDACTED_VALUE, REDACTED_VALUE
             )
+        );
+    }
+
+    #[test]
+    fn test_redact_sensitive_assignment_style_headers() {
+        assert_eq!(
+            sanitize_command_for_tracking("curl --header=Authorization:Bearer deadbeef"),
+            format!("curl --header={} {}", REDACTED_VALUE, REDACTED_VALUE)
+        );
+        assert_eq!(
+            sanitize_command_for_tracking("curl Header:Authorization=Bearer deadbeef"),
+            format!("curl Header:Authorization={} {}", REDACTED_VALUE, REDACTED_VALUE)
         );
     }
 

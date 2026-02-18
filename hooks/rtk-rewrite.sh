@@ -7,12 +7,21 @@
 if ! command -v jq &>/dev/null; then
   exit 0
 fi
-if [ -z "${RTK_BIN:-}" ] && ! command -v rtk &>/dev/null; then
+
+# Guard for RTK binary before strict shell mode.
+if [ -n "${RTK_BIN:-}" ]; then
+  if [ ! -x "${RTK_BIN}" ] && ! command -v rtk &>/dev/null; then
+    exit 0
+  fi
+elif ! command -v rtk &>/dev/null; then
   exit 0
 fi
 
 set -euo pipefail
-RTK_BIN="${RTK_BIN:-$(command -v rtk)}"
+RTK_BIN="${RTK_BIN:-}"
+if [ -z "$RTK_BIN" ] || [ ! -x "$RTK_BIN" ]; then
+  RTK_BIN="$(command -v rtk)"
+fi
 RTK_CMD="${RTK_BIN}"
 HOOK_MODE="${RTK_HOOK_MODE:-flex}"
 
@@ -43,6 +52,26 @@ trim() {
   local s
   s="$(trim_leading "$1")"
   trim_trailing "$s"
+}
+
+audit_log() {
+  if [ "${RTK_HOOK_AUDIT:-0}" != "1" ]; then
+    return
+  fi
+
+  local action="$1"
+  local original="$2"
+  local rewritten="${3:--}"
+  local ts dir file
+
+  original="${original//$'\n'/\\n}"
+  rewritten="${rewritten//$'\n'/\\n}"
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || printf "unknown-time")"
+  dir="${RTK_AUDIT_DIR:-${HOME:-/tmp}/.claude}"
+  file="$dir/hook-audit.log"
+
+  mkdir -p "$dir" 2>/dev/null || return
+  printf "%s | %s | %s | %s\n" "$ts" "$action" "$original" "$rewritten" >> "$file" 2>/dev/null || true
 }
 
 is_rtk_command() {
@@ -592,6 +621,13 @@ split_chain_with_separators() {
 rewrite_command_line() {
   local input="$1"
 
+  # Command substitution/backticks are parsing-ambiguous for lightweight splitting.
+  # Fail open to preserve exact shell behavior.
+  if [[ "$input" == *'$('* || "$input" == *'`'* ]]; then
+    printf ""
+    return
+  fi
+
   if ! split_chain_with_separators "$input"; then
     # Ambiguous parsing: fail open.
     printf ""
@@ -639,12 +675,27 @@ rewrite_command_line() {
   printf "%s" "$rebuilt"
 }
 
+CMD_TRIMMED="$(trim "$CMD")"
+
+if is_rtk_command "$CMD_TRIMMED"; then
+  audit_log "skip:already_rtk" "$CMD" "-"
+  exit 0
+fi
+
+if [[ "$CMD" == *'<<'* ]]; then
+  audit_log "skip:heredoc" "$CMD" "-"
+  exit 0
+fi
+
 REWRITTEN="$(rewrite_command_line "$CMD")"
 
 # If no rewrite needed, approve as-is
 if [ -z "$REWRITTEN" ]; then
+  audit_log "skip:no_match" "$CMD" "-"
   exit 0
 fi
+
+audit_log "rewrite" "$CMD" "$REWRITTEN"
 
 # Build the updated tool_input with all original fields preserved, only command changed
 ORIGINAL_INPUT=$(echo "$INPUT" | jq -c '.tool_input')
